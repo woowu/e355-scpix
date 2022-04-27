@@ -19,14 +19,12 @@ const makeCommandHandler = handler => {
                     cb = options;
                     options = { raw: false };
                 }
-                //device.flush(() => {
-                    console.log('>', line);
-                    if (! options.raw) line = line + '\r\n';
-                    device.write(line);
-                    device.drain(err => {
-                        ! cb || cb(err);
-                    });
-                //});
+                console.log('>', line);
+                if (! options.raw) line = line + '\r\n';
+                device.write(line);
+                device.drain(err => {
+                    ! cb || cb(err);
+                });
             };
         };
         const makeAtSender = () => {
@@ -42,10 +40,9 @@ const makeCommandHandler = handler => {
 
                 const endReceiving = () => {
                     device.removeListener('data', onData);
-                    const success = ! expect || response.search(expect) >= 0;
                     const r = response.trim().replace(/\r\n/g, '\n');
                     console.log('<', r, foundExpected ? '*' : '');
-                    cb(success ? null : new Error('AT failed'), r);
+                    cb(! expect.length || foundExpected ? null : new Error('AT failed'), r);
                 };
                 const searchExpect = () => {
                     if (! expect.length) return false;
@@ -157,18 +154,18 @@ const tcpOpen = (context, ip, port, cb) => {
     context.atSender({
         command: `at+qiopen=1,0,"TCP","${ip}",${port},0,0`,
         timeout: connDelay,
-        expect: 'OK',
+        expect: 'OK\r\n',
     }, (err, resp) => {
         cb(err || resp.search('OK') < 0 ? new Error('conn failed') : null);
     });
 };
 
 const tcpClose = (context, cb) => {
-    const closeDelay = 5; /* secs */
+    const closeDelay = 10500;
     context.atSender({
-        command: `at+qiclose=0,${closeDelay}`,
-        timeout: closeDelay * 1000 + 500,
-        expect: ['OK', 'MODEM TIMEOUT'],
+        command: 'at+qiclose=0',
+        timeout: closeDelay,
+        expect: ['OK\r\n', 'MODEM TIMEOUT'],
     }, (err, resp) => {
         cb(err);
     });
@@ -371,7 +368,7 @@ const commandModemInfo = (context, cb) => {
         'at+cpin?',
         'at+csq',
         'at+cereg?',
-        [ 'at+qiact?', 2500, 'OK' ],
+        [ 'at+qiact?', 2500, 'OK\r\n' ],
     ];
     atScriptRunner(query, context, cb);
 };
@@ -379,7 +376,7 @@ const commandModemInfo = (context, cb) => {
 const commandActivatePDP = (context, cb) => {
     var cid = context.argv.c;
     const script = [
-        [ `at+qiclose=0,3`, 2000, 'OK' ],
+        [ `at+qiclose=0,3`, 2000, 'OK\r\n' ],
         [ `at+qideact=${cid}`, 1000 ],
         [ `at+qiact=${cid}`, 1000 ],
         [ `at+qiact?`, 1000 ],
@@ -403,8 +400,6 @@ const commandTcpClose = (context, cb) => {
 };
 
 const commandTcpSend = (context, cb) => {
-    var [ip, port] = context.argv.address.split(':');
-    if (! ip || ! port) return cb(new Error('bad address'));
     const len = context.argv.len;
     if (len <= 0) return cb(new Error('bad length'));
 
@@ -438,17 +433,7 @@ const commandTcpSend = (context, cb) => {
     };
 
     makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
-        const sendDelay = 3000;
-        tcpOpen(context, ip, +port, err => {
-            if (err) return onExecEnd(err);
-            setTimeout(() => {
-                tcpSend(err => {
-                    tcpClose(context, () => {
-                        onExecEnd(err);
-                    });
-                });
-            }, sendDelay);
-        });
+        tcpSend(onExecEnd);
     }, cb);
 };
 
@@ -518,13 +503,13 @@ const argv = yargs(hideBin(process.argv))
     }, makeCommandHandler(commandActivatePDP))
     .command('tcp-send', 'Send data over TCP', yargs => {
         yargs
-            .option('address', {
-                alias: 'a',
-                describe: 'destination address <IP>:<PORT>',
-                nargs: 1,
-                type: 'string',
-                demandOption: true,
-            })
+            //.option('address', {
+            //    alias: 'a',
+            //    describe: 'destination address <IP>:<PORT>',
+            //    nargs: 1,
+            //    type: 'string',
+            //    demandOption: true,
+            //})
             .option('len', {
                 alias: 'n',
                 describe: 'length of data to send',
