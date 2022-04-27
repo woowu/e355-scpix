@@ -28,7 +28,11 @@ const makeCommandHandler = handler => {
             };
         };
         const makeAtSender = () => {
-            return ({command, timeout, expect}, cb) => {
+            return ({command, timeout, expect}, options, cb) => {
+                if (typeof options == 'function' || options === undefined ) {
+                    cb = options;
+                    options = { raw: false };
+                }
                 var timer;
                 var response = '';
                 var foundExpected = false;
@@ -42,7 +46,7 @@ const makeCommandHandler = handler => {
                     device.removeListener('data', onData);
                     const r = response.trim().replace(/\r\n/g, '\n');
                     console.log('<', r, foundExpected ? '*' : '');
-                    cb(! expect.length || foundExpected ? null : new Error('AT failed'), r);
+                    cb(! expect.length || foundExpected ? null : new Error('AT failed'), response);
                 };
                 const searchExpect = () => {
                     if (! expect.length) return false;
@@ -62,7 +66,7 @@ const makeCommandHandler = handler => {
 
                 timer = setTimeout(endReceiving, timeout);
                 device.on('data', onData);
-                makeLineSender()(command);
+                makeLineSender()(command, options);
             };
         };
 
@@ -156,7 +160,7 @@ const tcpOpen = (context, ip, port, cb) => {
         timeout: connDelay,
         expect: 'OK\r\n',
     }, (err, resp) => {
-        cb(err || resp.search('OK') < 0 ? new Error('conn failed') : null);
+        cb(err);
     });
 };
 
@@ -168,6 +172,39 @@ const tcpClose = (context, cb) => {
         expect: ['OK\r\n', 'MODEM TIMEOUT'],
     }, (err, resp) => {
         cb(err);
+    });
+};
+
+const tcpSend = (context, text, cb) => {
+    const sendTimeout = 10000;
+    context.atSender({
+        command: `at+qisend=0,${text.length}`,
+        timeout: 2000,
+        expect: '> \r\n',
+    }, (err, resp) => {
+        context.atSender({
+            command: text,
+            timeout: sendTimeout,
+            expect: 'SEND OK\r\n',
+        }, { raw: ! context.argv.optical }, (err, resp) => {
+            cb(err);
+        });
+    });
+};
+
+const tcpRecv = (context, cb) => {
+    const recvTimeout = 1000;
+    context.atSender({
+        command: `at+qird=0,${context.argv.mtu}`,
+        timeout: recvTimeout,
+        expect: 'OK\r\n',
+    }, (err, resp) => {
+        if (err) return cb(err);
+        const m = resp.match(/\+QIRD: (.*)\r\n/);
+        if (! m) return cb(new Error('socket read error:', resp));
+        const offset = m.index + m[0].length;
+        const data = resp.slice(offset, offset + parseInt(m[1]));
+        cb(null, data);
     });
 };
 
@@ -249,6 +286,8 @@ const commandPowerOff = (context, cb) => {
 };
 
 const commandForward = (context, cb) => {
+    if (! context.argv.optical) return cb(new Error('not available'));
+
     const status = context.argv.status;
     if (! status)
         return cb(new Error('on or off needed'));
@@ -401,7 +440,7 @@ const commandTcpClose = (context, cb) => {
 
 const commandTcpSend = (context, cb) => {
     const len = context.argv.len;
-    if (len <= 0) return cb(new Error('bad length'));
+    const mtu = context.argv.mtu;
 
     const lorem = new LoremIpsum({
         sentencesPerParagraph: {
@@ -413,28 +452,44 @@ const commandTcpSend = (context, cb) => {
             min: 5,
         },
     });
-    const text = lorem.generateSentences().slice(0, len);
-
-    const tcpSend = cb => {
-        const sendTimeout = 10000;
-        context.atSender({
-            command: `at+qisend=0,${len}`,
-            timeout: 2000,
-            expect: '> \r\n',
-        }, (err, resp) => {
-            context.atSender({
-                command: text,
-                timeout: sendTimeout,
-                expect: 'SEND OK\r\n',
-            }, (err, resp) => {
-                cb(err);
-            });
-        });
-    };
 
     makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
-        tcpSend(onExecEnd);
+        const send = (len, cb) => {
+            const thisLen = len < mtu ? len : mtu;
+            if (thisLen <= 0) return cb(null);
+
+            var text = '';
+            while (text.length < thisLen)
+                text += lorem.generateSentences().slice(0, thisLen - text.length);
+
+            tcpSend(context, text, err => {
+                if (err) return cb(err);
+                send(len - thisLen, cb);
+            });
+        };
+        send(len, onExecEnd);
     }, cb);
+};
+
+const commandTcpRecv = (context, cb) => {
+    const mtu = context.argv.mtu;
+
+    var received = '';
+    makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+        const recv = (soFar, cb) => {
+            tcpRecv(context, (err, data) => {
+                if (err || ! data) return cb(err, soFar);
+                recv(soFar + data, cb);
+            });
+        };
+        recv('', (err, data) => {
+            received = data;
+            onExecEnd(err);
+        });
+    }, err => {
+        console.log(received);
+        cb(err);
+    });
 };
 
 const argv = yargs(hideBin(process.argv))
@@ -447,10 +502,22 @@ const argv = yargs(hideBin(process.argv))
     })
     .option('baud', {
         alias: 'b',
-        describe: 'optical head baudrate',
+        describe: 'serial device baudrate',
         nargs: 1,
         type: 'number',
         default: 9600,
+    })
+    .option('mtu', {
+        alias: 'u',
+        describe: 'maximum send/receive size of socket data',
+        nargs: 1,
+        type: 'number',
+        default: 1024,
+    })
+    .option('optical', {
+        describe: 'is using optical head',
+        type: 'boolean',
+        default: true,
     })
     .command('test', 'Test scpi connectivity', yargs => {
     }, makeCommandHandler(commandTest))
@@ -501,23 +568,6 @@ const argv = yargs(hideBin(process.argv))
                 default: 1,
             });
     }, makeCommandHandler(commandActivatePDP))
-    .command('tcp-send', 'Send data over TCP', yargs => {
-        yargs
-            //.option('address', {
-            //    alias: 'a',
-            //    describe: 'destination address <IP>:<PORT>',
-            //    nargs: 1,
-            //    type: 'string',
-            //    demandOption: true,
-            //})
-            .option('len', {
-                alias: 'n',
-                describe: 'length of data to send',
-                nargs: 1,
-                type: 'number',
-                demandOption: true,
-            })
-    }, makeCommandHandler(commandTcpSend))
     .command('tcp-open', 'Open the TCP conn', yargs => {
         yargs
             .option('address', {
@@ -530,6 +580,18 @@ const argv = yargs(hideBin(process.argv))
     }, makeCommandHandler(commandTcpOpen))
     .command('tcp-close', 'Close the TCP conn', yargs => {
     }, makeCommandHandler(commandTcpClose))
+    .command('tcp-send', 'Send data over TCP', yargs => {
+        yargs
+            .option('len', {
+                alias: 'n',
+                describe: 'length of data to send',
+                nargs: 1,
+                type: 'number',
+                demandOption: true,
+            })
+    }, makeCommandHandler(commandTcpSend))
+    .command('tcp-recv', 'Receive data from TCP', yargs => {
+    }, makeCommandHandler(commandTcpRecv))
     .command('forward <status>', 'Turn on/off forwarding between modem and optical head', yargs => {
         yargs
             .positional('status', {
