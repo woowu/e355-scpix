@@ -235,54 +235,99 @@ const commandTest = (context, cb) => {
     probe();
 };
 
-const commandPowerOn = (context, cb) => {
+const commandModemPower = (context, cb) => {
     const readPowerGoodPin = 'DIGital:PIN? P52';
+    const readDccPin = 'DIGital:PIN? P51';
     const assertDcc = 'DIGital:PIN P51,HI';
-    const turnOnPowerKey = 'DIGital:PIN PD1,LO,500';
-    const powerOff = '0';
-    const powerOn = '1';
-    var state = 'query';
-
-    const onData = makeRespHandler(response => {
-        if (state != 'query') return;
-        console.log('<', response);
-
-        if (response == powerOff) {
-            state = 'setting';
-            context.lineSender(assertDcc);
-            setTimeout(() => {
-                context.lineSender(turnOnPowerKey);
-                setTimeout(() => {
-                    state = 'query';
-                    context.lineSender(readPowerGoodPin);
-                }, 1000);
-            }, 200);
-            return;
-        }
-        if (response == powerOn) {
-            context.device.removeListener('data', onData);
-            console.log('modem turned on');
-            cb(null);
-            return;
-        }
-        setTimeout(() => {
-            context.lineSender(readPowerGoodPin);
-        }, 200);
-    });
-    context.device.on('data', onData);
-    context.lineSender(readPowerGoodPin);
-};
-
-const commandPowerOff = (context, cb) => {
-    const turnOffPowerKey = 'DIGital:PIN PD1,LO,1000';
     const deassertDcc = 'DIGital:PIN P51,LO';
+    const turnOnPowerKey = 'DIGital:PIN PD1,LO,500';
+    const turnOffPowerKey = 'DIGital:PIN PD1,LO,1000';
+    const powerOffLevel = '0';
+    const powerOnLevel = '1';
+    const dccOffLevel = '0';
+    const dccOnLevel = '1';
 
-    context.lineSender(turnOffPowerKey);
-    setTimeout(() => {
-        context.lineSender(deassertDcc, () => {
-            cb(null);
+    const powerOn = cb => {
+        var state = 'query';
+
+        const onData = makeRespHandler(response => {
+            const dccDelay = 1000;
+            const queryDelay = 2000;
+
+            if (state != 'query') return;
+            console.log('<', response);
+
+            if (response == powerOffLevel) {
+                console.log('modem is off');
+                state = 'setting';
+                context.lineSender(assertDcc, err => {
+                    setTimeout(() => {
+                        context.lineSender(turnOnPowerKey);
+                        setTimeout(() => {
+                            state = 'query';
+                            context.lineSender(readPowerGoodPin);
+                        }, queryDelay);
+                    }, dccDelay);
+                });
+                return;
+            }
+            if (response == powerOnLevel) {
+                console.log('modem is on');
+                cb(null);
+                return;
+            }
         });
-    }, 500);
+        context.device.on('data', onData);
+        context.lineSender(readPowerGoodPin);
+    };
+
+    const powerOff = cb => {
+        const interCommandDelay = 1000;
+        context.lineSender(turnOffPowerKey, err => {
+            setTimeout(() => {
+                context.lineSender(deassertDcc, err => {
+                    cb(null);
+                });
+            }, interCommandDelay);
+        });
+    };
+
+    const powerStatus = cb => {
+        const execTimeout = 3000;
+        var state;
+        var timer;
+        const onData = makeRespHandler(response => {
+            console.log('<', response);
+            if (state == 'readPowerGood') {
+                console.log('modem is', response == powerOffLevel ? 'off' : 'on');
+
+                state = 'readDcc';
+                context.lineSender(readDccPin);
+                return;
+            }
+            if (state == 'readDcc') {
+                console.log('Modem DCC is', response == dccOffLevel ? 'off' : 'on');
+                if (timer) clearTimeout(timer);
+                cb(null);
+                return;
+            }
+        });
+        context.device.on('data', onData);
+        state = 'readPowerGood';
+        timer = setTimeout(() => {
+            cb(new Error('timeout'));
+        }, execTimeout);
+        context.lineSender(readPowerGoodPin);
+    };
+
+    const cmd = context.argv.subcommand;
+    if (cmd == 'status')
+        return powerStatus(cb);
+    if (cmd == 'off')
+        return powerOff(cb);
+    if (cmd == 'on')
+        return powerOn(cb);
+    console.error('unrecognized power command:', cmd);
 };
 
 const commandForward = (context, cb) => {
@@ -521,10 +566,13 @@ const argv = yargs(hideBin(process.argv))
     })
     .command('test', 'Test scpi connectivity', yargs => {
     }, makeCommandHandler(commandTest))
-    .command('modem-on', 'Turn on modem', yargs => {
-    }, makeCommandHandler(commandPowerOn))
-    .command('modem-off', 'Turn off modem', yargs => {
-    }, makeCommandHandler(commandPowerOff))
+    .command('modem-power <subcommand>', 'Turn on/off modem or query its power status', yargs => {
+        yargs
+            .positional('subcommand', {
+                type: 'string',
+                describe: 'status|on|off',
+                })
+    }, makeCommandHandler(commandModemPower))
     .command('modem-conf', 'Configure modem', yargs => {
         yargs
             .option('network', {
