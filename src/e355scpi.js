@@ -6,6 +6,22 @@ const { hideBin } = require('yargs/helpers');
 const { SerialPort } = require('serialport');
 const { LoremIpsum } = require('lorem-ipsum');
 
+const scpi = {
+    readModemPowerGoodPin: 'DIGital:PIN? P52',
+    readModemDccPin: 'DIGital:PIN? P51',
+    assertModemDcc: 'DIGital:PIN P51,HI',
+    deassertModemDcc: 'DIGital:PIN P51,LO',
+    turnOnModemPowerKey: 'DIGital:PIN PD1,LO,500',
+    turnOffModemPowerKey: 'DIGital:PIN PD1,LO,1000',
+    enableSciLoopback: 'WAN:LOOPback:STOp',
+    disableSciLoopback: 'WAN:LOOPback:STArt',
+    optoForwardingOn: 'SER:CON ON',
+    optoForwardingOff: '+++',
+    rebootDevice: 'PWRState:MONVolt 1600',
+};
+
+const defaultAtRespDelay = 1000;
+
 const makeCommandHandler = handler => {
     return argv => {
         const device = new SerialPort({
@@ -105,17 +121,15 @@ const makeRespHandler = handler => {
 };
 
 const makeAtEnvironment = (lineSender, execCb, onClose) => {
-    const scpiTurnOnForwarding = 'SER:CON ON';
-    const scpiTurnOffForwarding = '+++';
     const forwardingModeDelay = 2000;
 
-    lineSender(scpiTurnOnForwarding, () => {
+    lineSender(scpi.optoForwardingOn, () => {
         setTimeout(() => {
             /* when execution inside the execCb ends, the 2nd argument,
              * which is a onExecEnd callback must be called.
              */
             execCb(null, err => {
-                lineSender(scpiTurnOffForwarding, () => {
+                lineSender(scpi.optoForwardingOff, () => {
                     setTimeout(() => {
                         onClose(err);
                     }, forwardingModeDelay);
@@ -127,7 +141,6 @@ const makeAtEnvironment = (lineSender, execCb, onClose) => {
 
 const atScriptRunner = (script, context, cb) => {
     const interCommandDelay = 200;
-    const defaultAtRespDelay = 500;
 
     if (! Array.isArray(script)) script = [script];
 
@@ -226,6 +239,7 @@ const commandTest = (context, cb) => {
         process.stdin.setRawMode(false);
         context.device.removeListener('data', onData);
         if (timer) clearTimeout(timer);
+        context.device.removeListener('data', onData);
         cb(null);
     };
 
@@ -236,12 +250,6 @@ const commandTest = (context, cb) => {
 };
 
 const commandModemPower = (context, cb) => {
-    const readPowerGoodPin = 'DIGital:PIN? P52';
-    const readDccPin = 'DIGital:PIN? P51';
-    const assertDcc = 'DIGital:PIN P51,HI';
-    const deassertDcc = 'DIGital:PIN P51,LO';
-    const turnOnPowerKey = 'DIGital:PIN PD1,LO,500';
-    const turnOffPowerKey = 'DIGital:PIN PD1,LO,1000';
     const powerOffLevel = '0';
     const powerOnLevel = '1';
     const dccOffLevel = '0';
@@ -260,12 +268,12 @@ const commandModemPower = (context, cb) => {
             if (response == powerOffLevel) {
                 console.log('modem is off');
                 state = 'setting';
-                context.lineSender(assertDcc, err => {
+                context.lineSender(scpi.assertModemDcc, err => {
                     setTimeout(() => {
-                        context.lineSender(turnOnPowerKey);
+                        context.lineSender(scpi.turnOnModemPowerKey);
                         setTimeout(() => {
                             state = 'query';
-                            context.lineSender(readPowerGoodPin);
+                            context.lineSender(scpi.readModemPowerGoodPin);
                         }, queryDelay);
                     }, dccDelay);
                 });
@@ -273,19 +281,20 @@ const commandModemPower = (context, cb) => {
             }
             if (response == powerOnLevel) {
                 console.log('modem is on');
+                context.device.removeListener('data', onData);
                 cb(null);
                 return;
             }
         });
         context.device.on('data', onData);
-        context.lineSender(readPowerGoodPin);
+        context.lineSender(scpi.readModemPowerGoodPin);
     };
 
     const powerOff = cb => {
         const interCommandDelay = 1000;
-        context.lineSender(turnOffPowerKey, err => {
+        context.lineSender(scpi.turnOffModemPowerKey, err => {
             setTimeout(() => {
-                context.lineSender(deassertDcc, err => {
+                context.lineSender(scpi.deassertModemDcc, err => {
                     cb(null);
                 });
             }, interCommandDelay);
@@ -302,12 +311,13 @@ const commandModemPower = (context, cb) => {
                 console.log('modem is', response == powerOffLevel ? 'off' : 'on');
 
                 state = 'readDcc';
-                context.lineSender(readDccPin);
+                context.lineSender(scpi.readModemDccPin);
                 return;
             }
             if (state == 'readDcc') {
                 console.log('Modem DCC is', response == dccOffLevel ? 'off' : 'on');
                 if (timer) clearTimeout(timer);
+                context.device.removeListener('data', onData);
                 cb(null);
                 return;
             }
@@ -317,7 +327,7 @@ const commandModemPower = (context, cb) => {
         timer = setTimeout(() => {
             cb(new Error('timeout'));
         }, execTimeout);
-        context.lineSender(readPowerGoodPin);
+        context.lineSender(scpi.readModemPowerGoodPin);
     };
 
     const cmd = context.argv.subcommand;
@@ -337,14 +347,34 @@ const commandForward = (context, cb) => {
     if (! status)
         return cb(new Error('on or off needed'));
 
-    if (status.toLowerCase() == 'on') {
-        context.lineSender('SER:CON ON', () => {
+    if (status == 'on') {
+        context.lineSender(scpi.optoForwardingOn, () => {
             cb(null);
         });
         return;
     }
-    if (status.toLowerCase() == 'off') {
-        context.lineSender('+++', () => {
+    if (status == 'off') {
+        context.lineSender(scpi.optoForwardingOff, () => {
+            cb(null);
+        });
+        return;
+    }
+    console.error('Bad argument');
+};
+
+const commandSciLoopback = (context, cb) => { 
+    const status = context.argv.status;
+    if (! status)
+        return cb(new Error('on or off needed'));
+
+    if (status == 'on') {
+        context.lineSender(scpi.enableSciLoopback, () => {
+            cb(null);
+        });
+        return;
+    }
+    if (status == 'off') {
+        context.lineSender(scpi.disableSciLoopback, () => {
             cb(null);
         });
         return;
@@ -360,6 +390,7 @@ const commandSend = (context, cb) => {
     const onData = makeRespHandler(response => {
         if (timer) clearTimeout(timer);
         console.log('<', response);
+        context.device.removeListener('data', onData);
         cb(null);
     });
     timer = setTimeout(() => {
@@ -368,6 +399,17 @@ const commandSend = (context, cb) => {
     }, 2000);
     context.device.on('data', onData);
     context.lineSender(line, { raw: context.argv.raw })
+};
+
+const commandSendAt = (context, cb) => {
+    const argv = context.argv;
+    makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+        context.atSender({
+            command: argv.cmd,
+            timeout: argv.timeout ? +argv.timeout : defaultAtRespDelay,
+            expect: argv.expect ? argv.expect : 'OK',
+        }, onExecEnd);
+    }, cb);
 };
 
 const commandConfigModem = (context, cb) => {
@@ -537,23 +579,121 @@ const commandTcpRecv = (context, cb) => {
     });
 };
 
+const commandRebootDevice = (context, cb) => {
+    var timer;
+
+    const onData = makeRespHandler(response => {
+        console.log('<', response);
+        context.device.removeListener('data', onData);
+        if (timer) clearTimeout(timer);
+        cb(null);
+    });
+    timer = setTimeout(() => {
+        context.device.removeListener('data', onData);
+        cb(new Error('timeout'));
+    });
+    context.device.on('data', onData);
+    context.lineSender(scpi.rebootDevice);
+};
+
+/**
+ * Since NB85 meter firmware on, the modem Rx/Tx PINs will be set as GPIOs
+ * almost immediately after meter is powered up, in this state the AT
+ * traffics to the modem cannot through. To solve this difficulty, I send
+ * a SCPI command to turn the PINs back to UART mode just after they were
+ * set as GPIOs and before the modem power-up sequence will be starting.
+ * If I issue the SCPI command too earlier, the firmware's settings of
+ * turning the PINs GPIO will come after me and overwrite my settings; If
+ * I do it too later, the modem power-up sequence will start before my
+ * setting, and the start-up sequence will be facing with GPIO pins, that
+ * will cause the AT failure at its earlier stage, that in turn will fool
+ * the firmware to make it change UART's baud to the next one. Once the
+ * UART's baudrate was changed to a wrong one, there is no a SCPI command
+ * can change it back until the next power cycle.
+ *
+ * After the above described operations, the alogrithm will start a AT
+ * command to test whether the modem is up working, if not success,
+ * the same whole operation will repeat up to 5 times.
+ *
+ * There are two timing in the algo:
+ * - bootDelay: After I issued the SCPI command, how long the meter will
+ *              complete the reboot.
+ * - sendDelay: Since the meter's completed the reboot, how long I wait
+ *              before I issue another SCPI to change the PIN settings.
+ *              After the bootDelay and before the sendDelay, my bet is
+ *              the firmware code has already set the PINs as GPIOs and
+ *              the modem power-up sequence has not yet to start.
+ *
+ * A command line option '--sendDelayAdj' is provided to allow you to
+ * adjust the sendDelay value in case your meter has too much different
+ * timing. The current sendDelay value is 1200ms, your adjustment value
+ * , which should be a signed integer, will be add to this value.
+ */
+const commandUnlockNb85 = (context, cb) => {
+    const bootDelay = 2800;
+    const sendDelay = 1200;
+    const settingTimeout = 1000;
+    const modemWait = 10; /* secs */
+    const maxRetries = 5;
+
+    const retry = times => {
+        const atTest = () => {
+            console.log(`waiting ${modemWait} seconds for modem power up`);
+            setTimeout(() => {
+                context.argv.cmd = 'at';
+                commandSendAt(context, err => {
+                    if (err && times == maxRetries)
+                        return cb(new Error('reached max retries. operation failed'));
+                    if (err)
+                        return retry(times + 1);
+                    console.log('succeeded. modem UART has been unlocked.');
+                    cb(null);
+                });
+            }, modemWait * 1000);
+        };
+
+        context.lineSender(scpi.rebootDevice, err => {
+            setTimeout(() => {
+                context.device.flush();
+                setTimeout(() => {
+                    const scpiLoopbackDisable = scpi.disableSciLoopback;
+                    var timer;
+                    const onData = makeRespHandler(response => {
+                        if (timer) clearTimeout(timer);
+                        console.log('<', response);
+                        context.device.removeListener('data', onData);
+                        atTest();
+                    });
+                    context.device.on('data', onData);
+                    timer = setTimeout(() => {
+                        context.device.removeListener('data', onData);
+                        cb(new Error('scpi timeout'));
+                    }, settingTimeout);
+                    context.lineSender(scpiLoopbackDisable);
+                }, sendDelay);
+            }, bootDelay);
+        });
+    };
+    retry(0);
+};
+
 const argv = yargs(hideBin(process.argv))
     .version('0.1.0')
-    .option('device', {
-        alias: 'd',
+    .option('d', {
+        alias: 'device',
         describe: 'serial device name',
         demandOption: true,
         nargs: 1,
     })
-    .option('baud', {
-        alias: 'b',
+    .option('b', {
+        alias: 'baud',
         describe: 'serial device baudrate',
         nargs: 1,
         type: 'number',
         default: 9600,
     })
-    .option('mtu', {
-        alias: 'u',
+    .option('u', {
+        alias: 'mtu',
         describe: 'maximum send/receive size of socket data',
         nargs: 1,
         type: 'number',
@@ -575,29 +715,29 @@ const argv = yargs(hideBin(process.argv))
     }, makeCommandHandler(commandModemPower))
     .command('modem-conf', 'Configure modem', yargs => {
         yargs
-            .option('network', {
-                alias: 'n',
+            .option('t', {
+                alias: 'network',
                 describe: 'network type: CatM or NBIoT',
                 nargs: 1,
                 type: 'string',
                 default: 'NBIoT',
             })
-            .option('apn', {
-                alias: 'a',
+            .option('a', {
+                alias: 'apn',
                 describe: 'Network access point name (APN)',
                 nargs: 1,
                 type: 'string',
                 default: '',
             })
-            .option('username', {
-                alias: 'u',
+            .option('u', {
+                alias: 'username',
                 describe: 'username',
                 nargs: 1,
                 type: 'string',
                 default: '',
             })
-            .option('password', {
-                alias: 'p',
+            .option('p', {
+                alias: 'password',
                 describe: 'password',
                 nargs: 1,
                 type: 'string',
@@ -608,8 +748,8 @@ const argv = yargs(hideBin(process.argv))
     }, makeCommandHandler(commandModemInfo))
     .command('pdp-activate', 'Activate PDP context. Do it only after network registered', yargs => {
         yargs
-            .option('context-id', {
-                alias: 'c',
+            .option('c', {
+                alias: 'context-id',
                 describe: 'PDP context ID',
                 nargs: 1,
                 type: 'number',
@@ -618,8 +758,8 @@ const argv = yargs(hideBin(process.argv))
     }, makeCommandHandler(commandActivatePDP))
     .command('tcp-open', 'Open the TCP conn', yargs => {
         yargs
-            .option('address', {
-                alias: 'a',
+            .option('a', {
+                alias: 'address',
                 describe: 'destination address <IP>:<PORT>',
                 nargs: 1,
                 type: 'string',
@@ -630,8 +770,8 @@ const argv = yargs(hideBin(process.argv))
     }, makeCommandHandler(commandTcpClose))
     .command('tcp-send', 'Send data over TCP', yargs => {
         yargs
-            .option('len', {
-                alias: 'n',
+            .option('n', {
+                alias: 'len',
                 describe: 'length of data to send',
                 nargs: 1,
                 type: 'number',
@@ -640,6 +780,47 @@ const argv = yargs(hideBin(process.argv))
     }, makeCommandHandler(commandTcpSend))
     .command('tcp-recv', 'Receive data from TCP', yargs => {
     }, makeCommandHandler(commandTcpRecv))
+    .command('device-reboot', 'Reboot the device', yargs => {
+    }, makeCommandHandler(commandRebootDevice))
+    .command('unlock-nb85', 'Unlock NB85 modem UART', yargs => {
+    }, makeCommandHandler(commandUnlockNb85))
+    .command('sci-loopback <status>', 'Turn on/off loopback of SCI pins', yargs => {
+        yargs
+            .positional('status', {
+                type: 'string',
+                describe: 'on or off',
+                });
+    }, makeCommandHandler(commandSciLoopback))
+    .command('send <line>', 'Send single line to the deivce', yargs => {
+        yargs
+            .positional('line', {
+                type: 'string',
+                describe: 'text line to send',
+                })
+            .option('r', {
+                alias: 'raw',
+                describe: 'send raw data, no \r\n will be added to the end',
+                type: 'boolean',
+                default: false,
+            });
+    }, makeCommandHandler(commandSend))
+    .command('at <cmd>', 'Send single at command to the modem', yargs => {
+        yargs
+            .positional('cmd', {
+                type: 'string',
+                describe: 'AT command',
+                })
+            .option('o', {
+                alias: 'timeout',
+                describe: 'timeout ms',
+                type: 'number',
+            })
+            .option('e', {
+                alias: 'expect',
+                describe: 'Expect string in the response',
+                type: 'string',
+            });
+    }, makeCommandHandler(commandSendAt))
     .command('forward <status>', 'Turn on/off forwarding between modem and optical head', yargs => {
         yargs
             .positional('status', {
@@ -647,19 +828,6 @@ const argv = yargs(hideBin(process.argv))
                 describe: 'on or off',
                 });
     }, makeCommandHandler(commandForward))
-    .command('send <line>', 'Send single line to the deivce', yargs => {
-        yargs
-            .positional('line', {
-                type: 'string',
-                describe: 'text line to send',
-                })
-            .option('raw', {
-                alias: 'r',
-                describe: 'send raw data, no \r\n will be added to the end',
-                type: 'boolean',
-                default: false,
-            });
-    }, makeCommandHandler(commandSend))
     .help()
     .alias('help', 'h')
     .argv;
