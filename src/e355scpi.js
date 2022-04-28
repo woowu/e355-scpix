@@ -1,6 +1,7 @@
 #!/usr/bin/node --harmony
 'use strict';
 
+const fs = require('fs');
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 const { SerialPort } = require('serialport');
@@ -212,6 +213,7 @@ const tcpClose = (context, cb) => {
 };
 
 const tcpSend = (context, text, cb) => {
+    console.log('send data.', 'len', text.length);
     const sendTimeout = 10000;
     context.atSender({
         command: `at+qisend=0,${text.length}`,
@@ -426,13 +428,38 @@ const commandSend = (context, cb) => {
 
 const commandSendAt = (context, cb) => {
     const argv = context.argv;
-    makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
-        context.atSender({
-            command: argv.cmd,
-            timeout: argv.timeout ? +argv.timeout : defaultAtRespDelay,
-            expect: argv.expect ? argv.expect : 'OK',
-        }, onExecEnd);
-    }, cb);
+    var rs;
+    if (argv.file) {
+        rs = fs.createReadStream(argv.file);
+        rs.on('error', cb);
+    } else
+        rs = process.stdin;
+    const rl = require('readline').createInterface({
+        input: rs,
+    });
+
+    const specs = [];
+    rl.on('line', line => {
+        if (line.trim() == '') return;
+        const tokens = line.split(',');
+        const spec = {
+            command: tokens[0].trim(),
+            timeout: tokens[1] !== undefined ? +tokens[1] : defaultAtRespDelay,
+            expect: tokens[2] !== undefined ? tokens[2].trim() : ['OK', 'ERROR'],
+        };
+        specs.push(spec);
+    });
+    rl.on('close', () => {
+        makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+            const execSpec = specs => {
+                if (! specs.length) return onExecEnd(null);
+                context.atSender(specs.shift(), () => {
+                    execSpec(specs);
+                });
+            };
+            execSpec(specs);
+        }, cb);
+    });
 };
 
 const commandConfigModem = (context, cb) => {
@@ -677,8 +704,13 @@ const commandUnlockNb85 = (context, cb) => {
 
     const retry = repeatCount => {
         const atTest = cb => {
-            context.argv.cmd = 'at';
-            commandSendAt(context, cb);
+            makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+                context.atSender({
+                    command: 'at',
+                    timeout: defaultAtRespDelay,
+                    expect: 'OK',
+                }, onExecEnd); 
+            }, cb);
         };
         const linkTest = (count, cb) => {
             runScpi(context, scpi.readDeviceId, (response, cb) => {
@@ -788,7 +820,7 @@ const argv = yargs(hideBin(process.argv))
         describe: 'maximum send/receive size of socket data',
         nargs: 1,
         type: 'number',
-        default: 1024,
+        default: 1200,
     })
     .option('optical', {
         describe: 'is using optical head',
@@ -890,25 +922,17 @@ const argv = yargs(hideBin(process.argv))
                 })
             .option('r', {
                 alias: 'raw',
-                describe: 'send raw data, no \r\n will be added to the end',
+                describe: 'Send raw data, no \r\n will be added to the end',
                 type: 'boolean',
                 default: false,
             });
     }, makeCommandHandler(commandSend))
-    .command('at <cmd>', 'Send single at command to the modem', yargs => {
+    .command('at', 'Send AT commands to the modem', yargs => {
         yargs
-            .positional('cmd', {
-                type: 'string',
-                describe: 'AT command',
-                })
-            .option('o', {
-                alias: 'timeout',
-                describe: 'timeout ms',
-                type: 'number',
-            })
-            .option('e', {
-                alias: 'expect',
-                describe: 'Expect string in the response',
+            .option('f', {
+                alias: 'file',
+                describe: 'A file contains AT commands of "<CMD>[,timeout,expect]".'
+                    + ' When this option is not present, read commands from stdin.',
                 type: 'string',
             });
     }, makeCommandHandler(commandSendAt))
