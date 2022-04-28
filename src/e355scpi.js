@@ -24,6 +24,8 @@ const scpi = {
 
 const defaultAtRespDelay = 1000;
 const defaultScpiRespDelay = 800;
+const slowScpiRespDelay = 2000;
+const fastScpiRespDelay = 50;
 
 /**
  * Thirdparty: Box Muller transform.
@@ -140,8 +142,32 @@ const makeRespHandler = handler => {
             || response.length < 3)
             return;
         handler(response.trim());
-        response = '';
     };
+};
+
+const runScpi = (context, command, onResponse, timeout, cb) => {
+    if (typeof timeout == 'function') {
+        cb = timeout;
+        timeout = defaultScpiRespDelay;
+    }
+
+    var timer;
+    var onData;
+
+    const end = (err, data) => {
+        if (timer) clearTimeout(timer);
+        context.device.removeListener('data', onData);
+        cb(err, data);
+    };
+    onData = makeRespHandler(response => {
+        onResponse(response, end);
+    });
+    context.device.on('data', onData);
+    context.lineSender(command, () => {
+        timer = setTimeout(() => {
+            end(new Error(`${command} timeout`), null);
+        }, timeout); 
+    });
 };
 
 const makeAtEnvironment = (lineSender, execCb, onClose) => {
@@ -275,84 +301,71 @@ const commandTest = (context, cb) => {
 };
 
 const commandModemPower = (context, cb) => {
+    const dccWait = 100;
+    const powerKeyWait = 1500;
+    const powerWait = 2000;
+
     const powerOffLevel = '0';
     const powerOnLevel = '1';
     const dccOffLevel = '0';
     const dccOnLevel = '1';
 
     const powerOn = cb => {
-        var state = 'query';
-
-        const onData = makeRespHandler(response => {
-            const dccDelay = 1000;
-            const queryDelay = 2000;
-
-            if (state != 'query') return;
-            console.log('<', response);
-
+        runScpi(context, scpi.readModemPowerGoodPin, (response, cb) => {
+            cb(null, response);
+        }, (err, response) => {
+            if (err) return cb(err);
             if (response == powerOffLevel) {
                 console.log('modem is off');
-                state = 'setting';
-                context.lineSender(scpi.assertModemDcc, err => {
-                    setTimeout(() => {
-                        context.lineSender(scpi.turnOnModemPowerKey);
+                runScpi(context, scpi.assertModemDcc, (response, cb) => {
+                }, dccWait, err => {
+                    runScpi(context, scpi.turnOnModemPowerKey, (response, cb) => {
+                    }, powerKeyWait, err => {
                         setTimeout(() => {
-                            state = 'query';
-                            context.lineSender(scpi.readModemPowerGoodPin);
-                        }, queryDelay);
-                    }, dccDelay);
+                            runScpi(context, scpi.readModemPowerGoodPin, (response, cb) => {
+                                console.log('modem power is', response == powerOffLevel
+                                    ? 'off' : response == powerOnLevel ? 'on' : 'unknown');
+                                cb(null);
+                            }, powerWait, cb);
+                        });
+                    });
                 });
                 return;
             }
             if (response == powerOnLevel) {
                 console.log('modem is on');
-                context.device.removeListener('data', onData);
-                cb(null);
-                return;
+                return cb(null);
             }
+            return cb(new Error('modem power state unknown'));
         });
-        context.device.on('data', onData);
-        context.lineSender(scpi.readModemPowerGoodPin);
+        return;
     };
 
     const powerOff = cb => {
-        const interCommandDelay = 1000;
-        context.lineSender(scpi.turnOffModemPowerKey, err => {
-            setTimeout(() => {
-                context.lineSender(scpi.deassertModemDcc, err => {
-                    cb(null);
-                });
-            }, interCommandDelay);
+        runScpi(context, scpi.turnOffModemPowerKey, (response, cb) => {
+        }, powerKeyWait, err => {
+            runScpi(context, scpi.deassertModemDcc, (response, cb) => {
+            }, dccWait, err => {
+                cb(null);
+            });
         });
     };
 
     const powerStatus = cb => {
-        const execTimeout = 3000;
-        var state;
-        var timer;
-        const onData = makeRespHandler(response => {
-            console.log('<', response);
-            if (state == 'readPowerGood') {
-                console.log('modem is', response == powerOffLevel ? 'off' : 'on');
-
-                state = 'readDcc';
-                context.lineSender(scpi.readModemDccPin);
-                return;
-            }
-            if (state == 'readDcc') {
-                console.log('Modem DCC is', response == dccOffLevel ? 'off' : 'on');
-                if (timer) clearTimeout(timer);
-                context.device.removeListener('data', onData);
+        runScpi(context, scpi.readModemPowerGoodPin, (response, cb) => {
+            console.log('modem', response == powerOnLevel
+                ? 'is on' : response == powerOffLevel ? 'is off'
+                : 'power state unknown');
+            cb(null);
+        }, err => {
+            if (err) return cb(err);
+            runScpi(context, scpi.readModemDccPin, (response, cb) => {
+                console.log('Dcc', response == dccOnLevel
+                    ? 'asserted' : response == dccOffLevel ? 'deasserted'
+                    : 'state unkonwn');
                 cb(null);
-                return;
-            }
+            }, cb);
         });
-        context.device.on('data', onData);
-        state = 'readPowerGood';
-        timer = setTimeout(() => {
-            cb(new Error('timeout'));
-        }, execTimeout);
-        context.lineSender(scpi.readModemPowerGoodPin);
     };
 
     const cmd = context.argv.subcommand;
@@ -644,31 +657,6 @@ const commandRebootDevice = (context, cb) => {
     }, defaultScpiRespDelay);
     context.device.on('data', onData);
     context.lineSender(scpi.rebootDevice);
-};
-
-const runScpi = (context, command, onResponse, timeout, cb) => {
-    if (typeof timeout == 'function') {
-        cb = timeout;
-        timeout = defaultScpiRespDelay;
-    }
-
-    var timer;
-    var onData;
-
-    const end = err => {
-        if (timer) clearTimeout(timer);
-        context.device.removeListener('data', onData);
-        cb(err);
-    };
-    onData = makeRespHandler(response => {
-        onResponse(response, end);
-    });
-    context.device.on('data', onData);
-    context.lineSender(command, () => {
-        timer = setTimeout(() => {
-            end(new Error(`${command} timeout`));
-        }, defaultScpiRespDelay); 
-    });
 };
 
 /**
