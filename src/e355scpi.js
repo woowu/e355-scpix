@@ -7,6 +7,7 @@ const { SerialPort } = require('serialport');
 const { LoremIpsum } = require('lorem-ipsum');
 
 const scpi = {
+    readDeviceId: '*IDN?',
     readModemPowerGoodPin: 'DIGital:PIN? P52',
     readModemDccPin: 'DIGital:PIN? P51',
     assertModemDcc: 'DIGital:PIN P51,HI',
@@ -21,6 +22,28 @@ const scpi = {
 };
 
 const defaultAtRespDelay = 1000;
+const defaultScpiRespDelay = 800;
+
+/**
+ * Thirdparty: Box Muller transform.
+ */
+const randBoxMuller = (min, max, skew) => {
+    let u = 0, v = 0;
+    while(u === 0) u = Math.random() //Converting [0,1) to (0,1)
+    while(v === 0) v = Math.random()
+    let num = Math.sqrt( -2.0 * Math.log( u ) ) * Math.cos( 2.0 * Math.PI * v )
+
+    num = num / 10.0 + 0.5 // Translate to 0 -> 1
+    if (num > 1 || num < 0) 
+        num = randn_bm(min, max, skew) // resample between 0 and 1 if out of range
+
+    else{
+        num = Math.pow(num, skew) // Skew
+        num *= max - min // Stretch to fill range
+        num += min // offset to min
+    }
+    return num
+}; 
 
 const makeCommandHandler = handler => {
     return argv => {
@@ -226,7 +249,7 @@ const commandTest = (context, cb) => {
 
     const probe = () => {
         timer = setTimeout(probe, 1000);
-        context.lineSender('*IDN?');
+        context.lineSender(scpi.readDeviceId);
     };
     const onData = makeRespHandler(response => {
         if (timer) clearTimeout(timer);
@@ -591,9 +614,34 @@ const commandRebootDevice = (context, cb) => {
     timer = setTimeout(() => {
         context.device.removeListener('data', onData);
         cb(new Error('timeout'));
-    });
+    }, defaultScpiRespDelay);
     context.device.on('data', onData);
     context.lineSender(scpi.rebootDevice);
+};
+
+const runScpi = (context, command, onResponse, timeout, cb) => {
+    if (typeof timeout == 'function') {
+        cb = timeout;
+        timeout = defaultScpiRespDelay;
+    }
+
+    var timer;
+    var onData;
+
+    const end = err => {
+        if (timer) clearTimeout(timer);
+        context.device.removeListener('data', onData);
+        cb(err);
+    };
+    onData = makeRespHandler(response => {
+        onResponse(response, end);
+    });
+    context.device.on('data', onData);
+    context.lineSender(command, () => {
+        timer = setTimeout(() => {
+            end(new Error(`${command} timeout`));
+        }, defaultScpiRespDelay); 
+    });
 };
 
 /**
@@ -613,65 +661,108 @@ const commandRebootDevice = (context, cb) => {
  *
  * After the above described operations, the alogrithm will start a AT
  * command to test whether the modem is up working, if not success,
- * the same whole operation will repeat up to 5 times.
- *
- * There are two timing in the algo:
- * - bootDelay: After I issued the SCPI command, how long the meter will
- *              complete the reboot.
- * - sendDelay: Since the meter's completed the reboot, how long I wait
- *              before I issue another SCPI to change the PIN settings.
- *              After the bootDelay and before the sendDelay, my bet is
- *              the firmware code has already set the PINs as GPIOs and
- *              the modem power-up sequence has not yet to start.
- *
- * A command line option '--sendDelayAdj' is provided to allow you to
- * adjust the sendDelay value in case your meter has too much different
- * timing. The current sendDelay value is 1200ms, your adjustment value
- * , which should be a signed integer, will be add to this value.
+ * the whole operation will repeat with randomly adjusted timing until
+ * success.
  */
 const commandUnlockNb85 = (context, cb) => {
-    const bootDelay = 2800;
-    const sendDelay = 1200;
-    const settingTimeout = 1000;
-    const modemWait = 10; /* secs */
-    const maxRetries = 5;
+    const fromRebootOkToEnableLoopBack = 2900; /* my measure: 2.878s */
+    const fromEnableLoopbackToModemSetBaud = 3100; /* my measure: 3.142s */
+    const skew = 1.5;
+    const modemWaitSecs = 5;
+    const maxRepeats = 5;
+    const retryDelay = 1000;
+    const successMessage = 'succeeded. modem UART has been unlocked';
+    const modemWaitMessage = `waiting ${modemWaitSecs} seconds`
+        + ' for modem power up';
 
-    const retry = times => {
-        const atTest = () => {
-            console.log(`waiting ${modemWait} seconds for modem power up`);
+    const retry = repeatCount => {
+        const atTest = cb => {
+            context.argv.cmd = 'at';
+            commandSendAt(context, cb);
+        };
+        const linkTest = (count, cb) => {
+            runScpi(context, scpi.readDeviceId, (response, cb) => {
+                if (response.length) console.log('<', response);
+                cb(response.search('LANDIS') < 0
+                    ? new Error(
+                        'scpi link seems not working')
+                    : null);
+            }, err => {
+                if (err) {
+                    if (((count + 1) % 5) == 0)
+                        console.error('please check your cable'
+                            + ' or possibly power cycle the deivce');
+                    setTimeout(() => {
+                        linkTest(count + 1, cb);
+                    }, 200);
+                    return;
+                }
+                cb(null);
+            });
+        };
+        const sendReboot = cb => {
+            runScpi(context, scpi.rebootDevice, (response, cb) => {
+                if (response.length) console.log('<', response);
+                cb(response.search('OK') < 0
+                    ? new Error(
+                        'rebooting device failed')
+                    : null);
+            }, cb);
+        };
+        const disableLoopback = cb => {
+            runScpi(context, scpi.disableSciLoopback, (response, cb) => {
+                if (response.length) console.log('<', response);
+                cb(response.search('OK') < 0
+                    ? new Error(
+                        'disable loopback failed')
+                    : null);
+            }, cb);
+        };
+        const scheduleRetry = () => {
+            if (maxRepeats > 0 && repeatCount + 1 == maxRepeats)
+                return cb(new Error('reached max repeat count'
+                    + `(${repeatCount + 1})`));
             setTimeout(() => {
-                context.argv.cmd = 'at';
-                commandSendAt(context, err => {
-                    if (err && times == maxRetries)
-                        return cb(new Error('reached max retries. operation failed'));
-                    if (err)
-                        return retry(times + 1);
-                    console.log('succeeded. modem UART has been unlocked.');
-                    cb(null);
-                });
-            }, modemWait * 1000);
+                retry(repeatCount + 1)
+            }, retryDelay);
         };
 
-        context.lineSender(scpi.rebootDevice, err => {
-            setTimeout(() => {
-                context.device.flush();
+        const timeToDisableLoopback = randBoxMuller(fromRebootOkToEnableLoopBack - 200
+            , (fromRebootOkToEnableLoopBack + fromEnableLoopbackToModemSetBaud) + 200
+            , skew);
+
+        linkTest(0, err => {
+            if (err) return cb(err);
+            sendReboot(err => {
+                if (err) {
+                    console.error(err.message);
+                    scheduleRetry();
+                    return;
+                }
+                console.log('use delay'
+                    + ` ${(timeToDisableLoopback/1000).toFixed(3)} secs`);
                 setTimeout(() => {
-                    const scpiLoopbackDisable = scpi.disableSciLoopback;
-                    var timer;
-                    const onData = makeRespHandler(response => {
-                        if (timer) clearTimeout(timer);
-                        console.log('<', response);
-                        context.device.removeListener('data', onData);
-                        atTest();
+                    disableLoopback(err => {
+                        if (err) {
+                            console.error(err.message);
+                            scheduleRetry();
+                            return
+                        }
+                        console.log(modemWaitMessage);
+                        setTimeout(() => {
+                            atTest(err => {
+                                if (err) {
+                                    console.error(err.message);
+                                    scheduleRetry();
+                                    return;
+                                }
+                                console.log(successMessage);
+                                cb(null);
+                            });
+                        }, modemWaitSecs * 1000);
                     });
-                    context.device.on('data', onData);
-                    timer = setTimeout(() => {
-                        context.device.removeListener('data', onData);
-                        cb(new Error('scpi timeout'));
-                    }, settingTimeout);
-                    context.lineSender(scpiLoopbackDisable);
-                }, sendDelay);
-            }, bootDelay);
+                }, timeToDisableLoopback);
+            });
         });
     };
     retry(0);
