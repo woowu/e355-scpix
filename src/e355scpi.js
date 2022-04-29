@@ -24,8 +24,6 @@ const scpi = {
 
 const defaultAtRespDelay = 1000;
 const defaultScpiRespDelay = 800;
-const slowScpiRespDelay = 2000;
-const fastScpiRespDelay = 50;
 
 /**
  * Thirdparty: Box Muller transform.
@@ -142,6 +140,7 @@ const makeRespHandler = handler => {
             || response.length < 3)
             return;
         handler(response.trim());
+        response = '';
     };
 };
 
@@ -303,7 +302,7 @@ const commandTest = (context, cb) => {
 const commandModemPower = (context, cb) => {
     const dccWait = 100;
     const powerKeyWait = 1500;
-    const powerWait = 2000;
+    const powerOnWait = 2000;
 
     const powerOffLevel = '0';
     const powerOnLevel = '1';
@@ -326,8 +325,8 @@ const commandModemPower = (context, cb) => {
                                 console.log('modem power is', response == powerOffLevel
                                     ? 'off' : response == powerOnLevel ? 'on' : 'unknown');
                                 cb(null);
-                            }, powerWait, cb);
-                        });
+                            }, cb);
+                        }, powerOnWait);
                     });
                 });
                 return;
@@ -815,7 +814,7 @@ const argv = yargs(hideBin(process.argv))
         type: 'boolean',
         default: true,
     })
-    .command('test', 'Test scpi connectivity', yargs => {
+    .command('ping', 'Test scpi connectivity by sending *IDN?', yargs => {
     }, makeCommandHandler(commandTest))
     .command('modem-power <subcommand>', 'Turn on/off modem or query its power status', yargs => {
         yargs
@@ -915,7 +914,7 @@ const argv = yargs(hideBin(process.argv))
                 default: false,
             });
     }, makeCommandHandler(commandSend))
-    .command('at', 'Send AT commands to the modem', yargs => {
+    .command('at', 'Run AT script loaded from a file or read from stdin', yargs => {
         yargs
             .option('f', {
                 alias: 'file',
