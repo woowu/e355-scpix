@@ -249,6 +249,30 @@ const makeRespHandler = handler => {
     };
 };
 
+const fileReducer = (context, file, resultSet, lineHandler, resultsHandler) => {
+    var rs;
+    if (file != '-') {
+        rs = fs.createReadStream(argv.file);
+        rs.on('error', cb);
+    } else
+        rs = process.stdin;
+    const rl = require('readline').createInterface({
+        input: rs,
+    });
+
+    const specs = [];
+    rl.on('line', line => {
+        if (line.trim() == '') return;
+        lineHandler(line, result => {
+            resultSet.push(result);
+        });
+    });
+    rl.on('close', () => {
+        resultsHandler(resultSet);
+    });
+};
+
+
 const runScpi = (context, command, onResponse, timeout, cb) => {
     if (typeof timeout == 'function') {
         cb = timeout;
@@ -560,49 +584,41 @@ const commandSciLoopback = (context, cb) => {
     console.error('Bad argument');
 };
 
-const commandSend = (context, cb) => {
-    var timer;
-    const line = context.argv.line;
-    if (! line) return cb(new Error('missed line'));
-
-    const onData = makeRespHandler(response => {
-        if (timer) clearTimeout(timer);
-        console.log('<', response);
-        context.device.removeListener('data', onData);
-        cb(null);
+const commandRunScpi = (context, cb) => {
+    fileReducer(context, argv.file ? argv.file : '-', [], (line, cb) => {
+        const tokens = line.split(';');
+        cb({
+            command: tokens[0].trim(),
+            timeout: tokens[1] !== undefined ? +tokens[1] : context.timing.atRespDelay,
+        });
+    }, specs => {
+        const execSpec = specs => {
+            if (! specs.length) return cb(null);
+            const { command, timeout } = specs.shift();
+            console.log('exec', command, 'timeout', timeout);
+            runScpi(context, command, (response, cb) => {
+                console.log(response);
+                cb(null);
+            }, timeout, err => {
+                if (err) return cb(err);
+                execSpec(specs);
+            });
+        };
+        execSpec(specs);
     });
-    timer = setTimeout(() => {
-        context.device.removeListener('data', onData);
-        cb(null);
-    }, 2000);
-    context.device.on('data', onData);
-    context.lineSender(line, { raw: context.argv.raw })
 };
 
 const commandRunAt = (context, cb) => {
-    const argv = context.argv;
-    var rs;
-    if (argv.file) {
-        rs = fs.createReadStream(argv.file);
-        rs.on('error', cb);
-    } else
-        rs = process.stdin;
-    const rl = require('readline').createInterface({
-        input: rs,
-    });
-
-    const specs = [];
-    rl.on('line', line => {
-        if (line.trim() == '') return;
+    fileReducer(context, argv.file ? argv.file : '-', [], (line, cb) => {
         const tokens = line.split(';');
-        const spec = {
+        cb({
             command: tokens[0].trim(),
-            timeout: tokens[1] !== undefined ? +tokens[1] : context.timing.atRespDelay,
-            expect: tokens[2] !== undefined ? tokens[2].trim() : ['OK\r\n', 'ERROR\r\n'],
-        };
-        specs.push(spec);
-    });
-    rl.on('close', () => {
+            timeout: tokens[1] !== undefined && tokens[1] != ''
+                ? +tokens[1] : context.timing.atRespDelay,
+            expect: tokens[2] !== undefined
+                ? tokens[2].trim() : ['OK\r\n', 'ERROR\r\n'],
+        });
+    }, specs => {
         makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
             const execSpec = specs => {
                 if (! specs.length) return onExecEnd(null);
@@ -966,26 +982,26 @@ const argv = yargs(hideBin(process.argv))
     .version('0.1.0')
     .option('d', {
         alias: 'device',
-        describe: 'serial device name',
+        describe: 'Serial device name',
         demandOption: true,
         nargs: 1,
     })
     .option('b', {
         alias: 'baud',
-        describe: 'serial device baudrate',
+        describe: 'Serial device baudrate',
         nargs: 1,
         type: 'number',
         default: 9600,
     })
     .option('u', {
         alias: 'mtu',
-        describe: 'maximum send/receive size of socket data',
+        describe: 'Maximum send/receive size of socket data',
         nargs: 1,
         type: 'number',
         default: maxMtu,
     })
     .option('optical', {
-        describe: 'is using optical head',
+        describe: 'Use optical head',
         type: 'boolean',
         default: true,
     })
@@ -1118,24 +1134,20 @@ const argv = yargs(hideBin(process.argv))
                 describe: 'on or off',
                 });
     }, makeCommandHandler(commandSciLoopback))
-    .command('send <line>', 'Send a scpi command to the deivce', yargs => {
+    .command('scpi', 'Run SCPI script loaded from a file or read from stdin', yargs => {
         yargs
-            .positional('line', {
+            .option('f', {
+                alias: 'file',
+                describe: 'A file contains SCPI commands of "command[;timeout]".'
+                    + ' When this option is not present, read commands from stdin.',
                 type: 'string',
-                describe: 'text line to send',
-                })
-            .option('r', {
-                alias: 'raw',
-                describe: 'Send raw data, no \r\n will be added to the end',
-                type: 'boolean',
-                default: false,
             });
-    }, makeCommandHandler(commandSend))
+    }, makeCommandHandler(commandRunScpi))
     .command('at', 'Run AT script loaded from a file or read from stdin', yargs => {
         yargs
             .option('f', {
                 alias: 'file',
-                describe: 'A file contains AT commands of "<CMD>[,timeout,expect]".'
+                describe: 'A file contains AT commands of "command[;timeout;expect]".'
                     + ' When this option is not present, read commands from stdin.',
                 type: 'string',
             });
