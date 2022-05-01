@@ -22,8 +22,46 @@ const scpi = {
     rebootDevice: 'PWRState:MONVolt 1600',
 };
 
-const defaultAtRespDelay = 1000;
-const defaultScpiRespDelay = 800;
+/**
+ * The Quectel modem allow the max size of sending and receiving of 1460/1500
+ * octets. But the bottlenecks are the sizes of buffers that meter forwarding
+ * task used for receiving and sending.
+ *
+ * For receiving from the forwarding task, i.e., PC sending, the buffers chain
+ * is: UART rx buffer (240 bytes) --> task rx buffer (1024 bytes), hence the PC
+ * can send up to 240 + 1024 - 2 (for \r\n) = 1262 bytes in one shot, that
+ * defined the TX MTU in this tool.
+ *
+ * For sending from the forwarding task, i.e., PC receiving,  the data needs to
+ * be fully hold in the tx buffer of the forwarding task before it can send them
+ * to the PC. And, when talking about large size sending from the forwarding
+ * task, that always means it's TCP/UDP data triggered by executing of +qird
+ * command, this type of data has the form of:
+ * +QIRD:\x20<nnn>\r\n<DATA>\r\nOK\r\n. That means there are 14 octets of
+ * overhead. The max size of the enclosed TCP/UDP data is therefore up to 1024 -
+ * 18 = 1006 byte, which defined our RX MTU in this tool.
+ *
+ * We just pick up the minimum of TX MTU and RX MTU, that is 1014 as our max MTU
+ * size.
+  */
+const maxMtu = 1006;
+const maxTimeout = 2**31 - 1;
+const realTiming = {
+    atRespDelay: 1000,
+    scpiRespDelay: 800,
+    tcpConnDelay: 10000,
+    tcpCloseDelay: 10500,
+    tcpSendTimeout: 10000,
+    tcpRecvTimeout: 1000,
+};
+const forSimulatingTiming = {
+    atRespDelay: maxTimeout,
+    scpiRespDelay: maxTimeout,
+    tcpConnDelay: maxTimeout,
+    tcpCloseDelay: maxTimeout,
+    tcpSendTimeout: maxTimeout,
+    tcpRecvTimeout: maxTimeout,
+};
 
 /**
  * Thirdparty: Box Muller transform.
@@ -46,8 +84,32 @@ const randBoxMuller = (min, max, skew) => {
     return num
 }; 
 
+const generateText = len => {
+    const lorem = new LoremIpsum({
+        sentencesPerParagraph: {
+            max: 100,
+            min: 100,
+        },
+        wordsPerSentence: {
+            max: 50,
+            min: 5,
+        },
+    });
+    var text = '';
+    while (text.length < len)
+        text += lorem.generateSentences().slice(0, len - text.length);
+    return text;
+};
+
 const makeCommandHandler = handler => {
+    const interCharTimeout = 20;
+
     return argv => {
+        if (argv.mtu < 1 || argv.mtu > maxMtu) {
+            console.error('invalid mtu:', argv.mtu);
+            return;
+        }
+
         const device = new SerialPort({
             path: argv.device,
             baudRate: argv.baud,
@@ -67,13 +129,22 @@ const makeCommandHandler = handler => {
                 });
             };
         };
+
+        /**
+         * Create closure of function atSender(atSpec, timeout, cb):
+         *      atSpect <Object> {command, timeout, expect}
+         *      options <Object>
+         *      cb      <Function> (err)
+         */
         const makeAtSender = () => {
+            const scpiTimeoutStr = '\r\nMODEM TIMEOUT\r\n';
+
             return ({command, timeout, expect}, options, cb) => {
                 if (typeof options == 'function' || options === undefined ) {
                     cb = options;
                     options = { raw: false };
                 }
-                var timer;
+                var interCharTimer, callerTimer;
                 var response = '';
                 var foundExpected = false;
 
@@ -82,12 +153,6 @@ const makeCommandHandler = handler => {
                 else if (typeof expect == 'string')
                     expect = [expect];
 
-                const endReceiving = () => {
-                    device.removeListener('data', onData);
-                    const r = response.trim().replace(/\r\n/g, '\n');
-                    console.log('<', r, foundExpected ? '*' : '');
-                    cb(! expect.length || foundExpected ? null : new Error('AT failed'), response);
-                };
                 const searchExpect = () => {
                     if (! expect.length) return false;
 
@@ -95,16 +160,55 @@ const makeCommandHandler = handler => {
                     for (i = 0; i < expect.length && response.search(expect[i]) < 0; ++i);
                     return i < expect.length;
                 };
-                const onData = data => {
-                    response += data.toString();
+                const endReceiving = () => {
+                    device.removeListener('data', onData);
+                    const r = response.trim().replace(/\r\n/g, '\n');
+                    console.log('<', r, foundExpected ? '*' : '');
+                    cb(! expect.length || foundExpected ? null : new Error('AT failed'), response);
+                };
+                const onCallerTimeout = () => {
+                    callerTimer = null;
+                    if (interCharTimer) {
+                        clearTimeout(interCharTimer);
+                        interCharTimer = null;
+                    }
+                    endReceiving();
+                };
+                const onInterCharTimeout = () => {
+                    interCharTimer = null;
+                    if (response.search(scpiTimeoutStr) >= 0) {
+                        /* I received the special string scpiTimeoutStr, that
+                         * means the modem has yet to response, and we still
+                         * want to wait for it, but the scpi server has reached
+                         * its timeout time (2s). After the timeout, the scpi
+                         * server's turned to me, this is wrong, I need to fool
+                         * it to turn back to the modem by sending it some
+                         * non-sense things with what she expected line ending.
+                         * But there is a catch, whatever I send to her will be
+                         * forwarded to the modem, hope this is fine.
+                         */
+                        response = response.split(scpiTimeoutStr).join('');
+                        console.log(`[${scpiTimeoutStr.trim()}]`);
+                        device.write(' \r\n');
+                    }
                     if (searchExpect()) {
                         foundExpected = true;
-                        clearTimeout(timer);
+                        if (callerTimer) {
+                            clearTimeout(callerTimer);
+                            callerTimer = null;
+                        }
                         endReceiving();
+                        return;
                     }
+                    interCharTimer = setTimeout(onInterCharTimeout, interCharTimeout);
+                };
+                const onData = data => {
+                    response += data.toString();
                 };
 
-                timer = setTimeout(endReceiving, timeout);
+                if (timeout > interCharTimeout)
+                    callerTimer = setTimeout(onCallerTimeout, timeout);
+                interCharTimer = setTimeout(onInterCharTimeout, interCharTimeout);
                 device.on('data', onData);
                 makeLineSender()(command, options);
             };
@@ -115,6 +219,7 @@ const makeCommandHandler = handler => {
             device,
             lineSender: makeLineSender(),
             atSender: makeAtSender(),
+            timing: argv.simulate ? forSimulatingTiming : realTiming,
         };
         device.open(err => {
             if (err) {
@@ -147,7 +252,7 @@ const makeRespHandler = handler => {
 const runScpi = (context, command, onResponse, timeout, cb) => {
     if (typeof timeout == 'function') {
         cb = timeout;
-        timeout = defaultScpiRespDelay;
+        timeout = context.timing.scpiRespDelay;
     }
 
     var timer;
@@ -170,7 +275,7 @@ const runScpi = (context, command, onResponse, timeout, cb) => {
 };
 
 const makeAtEnvironment = (lineSender, execCb, onClose) => {
-    const forwardingModeDelay = 2000;
+    const forwardCommandDelay = 500;
 
     lineSender(scpi.optoForwardingOn, () => {
         setTimeout(() => {
@@ -181,10 +286,10 @@ const makeAtEnvironment = (lineSender, execCb, onClose) => {
                 lineSender(scpi.optoForwardingOff, () => {
                     setTimeout(() => {
                         onClose(err);
-                    }, forwardingModeDelay);
+                    }, forwardCommandDelay);
                 });
             });
-        }, forwardingModeDelay);
+        }, forwardCommandDelay);
     });
 };
 
@@ -199,7 +304,7 @@ const atScriptRunner = (script, context, cb) => {
         const e = script.shift();
         var spec;
         if (typeof e == 'string')
-            spec = { command: e, timeout: defaultAtRespDelay, expect: null };
+            spec = { command: e, timeout: context.timing.atRespDelay, expect: null };
         else
             spec = { command: e[0], timeout: e[1], expect: e[2] ? e[2] : null };
         context.atSender(spec, err => {
@@ -216,10 +321,9 @@ const atScriptRunner = (script, context, cb) => {
 };
 
 const tcpOpen = (context, ip, port, cb) => {
-    const connDelay = 30000;
     context.atSender({
         command: `at+qiopen=1,0,"TCP","${ip}",${port},0,0`,
-        timeout: connDelay,
+        timeout: context.timing.tcpConnDelay,
         expect: 'OK\r\n',
     }, (err, resp) => {
         cb(err);
@@ -227,10 +331,9 @@ const tcpOpen = (context, ip, port, cb) => {
 };
 
 const tcpClose = (context, cb) => {
-    const closeDelay = 10500;
     context.atSender({
         command: 'at+qiclose=0',
-        timeout: closeDelay,
+        timeout: context.timing.tcpCloseDelay,
         expect: ['OK\r\n', 'MODEM TIMEOUT'],
     }, (err, resp) => {
         cb(err);
@@ -239,15 +342,15 @@ const tcpClose = (context, cb) => {
 
 const tcpSend = (context, text, cb) => {
     console.log('send data.', 'len', text.length);
-    const sendTimeout = 10000;
     context.atSender({
         command: `at+qisend=0,${text.length}`,
-        timeout: 2000,
+        timeout: context.timing.atRespDelay,
         expect: '> \r\n',
     }, (err, resp) => {
+        if (err) return cb(err);
         context.atSender({
             command: text,
-            timeout: sendTimeout,
+            timeout: context.timing.tcpSendTimeout,
             expect: 'SEND OK\r\n',
         }, { raw: ! context.argv.optical }, (err, resp) => {
             cb(err);
@@ -255,18 +358,50 @@ const tcpSend = (context, text, cb) => {
     });
 };
 
+const tcpSendBig = (context, text, mtu, cb) => {
+    const send = (text, cb) => {
+        if (! text.length) return cb(null);
+        tcpSend(context, text.slice(0, mtu), err => {
+            if (err) return cb(err);
+            send(text.slice(mtu), cb);
+        });
+    };
+    send(text, cb);
+};
+
 const tcpRecv = (context, cb) => {
-    const recvTimeout = 1000;
+    const head = /\+QIRD: /;
+    const headLen = 7;
+    const tail = '\r\nOK\r\n';
+    const formatErrMessage = '+QIRD message invalid';
+
     context.atSender({
         command: `at+qird=0,${context.argv.mtu}`,
-        timeout: recvTimeout,
-        expect: 'OK\r\n',
+        timeout: context.timing.tcpRecvTimeout,
+        expect: tail,
     }, (err, resp) => {
         if (err) return cb(err);
-        const m = resp.match(/\+QIRD: (.*)\r\n/);
-        if (! m) return cb(new Error('socket read error:', resp));
-        const offset = m.index + m[0].length;
-        const data = resp.slice(offset, offset + parseInt(m[1]));
+        if (resp.search(head)
+            || resp.slice(resp.length - tail.length) != tail)
+            return cb(new Error('01' +  formatErrMessage))
+
+        var data = resp.slice(resp.search(head) + headLen
+            , resp.length - tail.length);
+        var len = 0;
+        while (data.length) {
+            if (! (data[0] >= '0' && data[0] <= '9'))
+                break;
+            len = len * 10 + (data[0] - '0');
+            data = data.slice(1);
+        }
+        if (len && data.slice(0, 2) != '\r\n')
+            return cb(new Error('02' + formatErrMessage))
+        if (len) data = data.slice(2)
+        if (len != data.length) {
+            console.log('03', len, data.length, data);
+            return cb(new Error('03' + formatErrMessage))
+        }
+
         cb(null, data);
     });
 };
@@ -318,14 +453,20 @@ const commandModemPower = (context, cb) => {
                 console.log('modem is off');
                 runScpi(context, scpi.assertModemDcc, (response, cb) => {
                 }, dccWait, err => {
-                    runScpi(context, scpi.turnOnModemPowerKey, (response, cb) => {
-                    }, powerKeyWait, err => {
-                        setTimeout(() => {
-                            runScpi(context, scpi.readModemPowerGoodPin, (response, cb) => {
-                                console.log('modem power is', response == powerOffLevel
-                                    ? 'off' : response == powerOnLevel ? 'on' : 'unknown');
-                                cb(null);
-                            }, cb);
+                    runScpi(context, scpi.turnOnModemPowerKey
+                        , (response, cb) => {
+                        }, powerKeyWait, err => {
+                            setTimeout(() => {
+                                runScpi(context, scpi.readModemPowerGoodPin
+                                    , (response, cb) => {
+                                        console.log('modem power is',
+                                            response == powerOffLevel
+                                            ? 'off'
+                                            : response == powerOnLevel
+                                            ? 'on'
+                                            : 'unknown');
+                                        cb(null);
+                                    }, cb);
                         }, powerOnWait);
                     });
                 });
@@ -438,7 +579,7 @@ const commandSend = (context, cb) => {
     context.lineSender(line, { raw: context.argv.raw })
 };
 
-const commandSendAt = (context, cb) => {
+const commandRunAt = (context, cb) => {
     const argv = context.argv;
     var rs;
     if (argv.file) {
@@ -453,11 +594,11 @@ const commandSendAt = (context, cb) => {
     const specs = [];
     rl.on('line', line => {
         if (line.trim() == '') return;
-        const tokens = line.split(',');
+        const tokens = line.split(';');
         const spec = {
             command: tokens[0].trim(),
-            timeout: tokens[1] !== undefined ? +tokens[1] : defaultAtRespDelay,
-            expect: tokens[2] !== undefined ? tokens[2].trim() : ['OK', 'ERROR'],
+            timeout: tokens[1] !== undefined ? +tokens[1] : context.timing.atRespDelay,
+            expect: tokens[2] !== undefined ? tokens[2].trim() : ['OK\r\n', 'ERROR\r\n'],
         };
         specs.push(spec);
     });
@@ -565,9 +706,9 @@ const commandActivatePDP = (context, cb) => {
     var cid = context.argv.c;
     const script = [
         [ `at+qiclose=0,3`, 2000, 'OK\r\n' ],
-        [ `at+qideact=${cid}`, 1000 ],
-        [ `at+qiact=${cid}`, 1000 ],
-        [ `at+qiact?`, 1000 ],
+        [ `at+qideact=${cid}`, 3000, 'OK\r\n' ],
+        [ `at+qiact=${cid}`, 2000, 'OK\r\n' ],
+        [ `at+qiact?`, 2500, 'OK\r\n' ],
     ];
     atScriptRunner(script, context, cb);
 };
@@ -581,6 +722,65 @@ const commandTcpOpen = (context, cb) => {
     }, cb);
 };
 
+const commandTcpPing = (context, cb) => {
+    var [ip, port] = context.argv.address.split(':');
+    if (! ip || ! port) return cb(new Error('bad address'));
+    var repeats = context.argv.n ? parseInt(context.argv.n) : 0;
+    if (repeats < 0) return cb(new Error('bad argument'));
+    const size = parseInt(context.argv.size);
+    if (size <= 0) return cb(new Error('bad argument'));
+    const timeout = context.argv.timeout * 1000;
+    if (timeout < 0) return cb(new Error('bad timeout'));
+    const interMessageDelay = context.argv.delay * 1000;
+    if (interMessageDelay < 0) return cb(new Error('bad delay time'));
+    const mtu = context.argv.mtu <= 0 ? 1 : parseInt(context.argv.mtu);
+
+    makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+        tcpOpen(context, ip, +port, err => {
+            if (err) return onExecEnd(err);
+            const pingNext = cb => {
+                const sent = generateText(size);
+                tcpSendBig(context, sent, mtu, err => {
+                    const recvDelay = 500;
+                    if (err) return cb(err);
+                    var received = '';
+                    const recvNext = cb => {
+                        tcpRecv(context, (err, data) => {
+                            if (err) return cb(err);
+                            /* if we've yet received anything, we keep waiting;
+                             * if we've already received something then got an
+                             * empty data, that mean EOF and we should stop
+                             * receiving.
+                             */
+                            if (received.length && ! data.length) {
+                                console.log('<', received);
+                                return cb(received != sent
+                                    ? new Error('received data mismatched')
+                                    : null);
+                            }
+                            received += data;
+                            setTimeout(() => {
+                                recvNext(cb);
+                            }, recvDelay);
+                        });
+                    };
+                    recvNext(err => {
+                        if (err) return cb(err);
+                        setTimeout(() => {
+                            if (--repeats == 0) return cb(null);
+                            pingNext(cb);
+                        }, interMessageDelay);
+                    });
+                });
+            };
+            pingNext(err => {
+                if (err) console.error(err.message);
+                tcpClose(context, onExecEnd);
+            });
+        });
+    }, cb);
+};
+
 const commandTcpClose = (context, cb) => {
     makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
         tcpClose(context, onExecEnd);
@@ -588,35 +788,12 @@ const commandTcpClose = (context, cb) => {
 };
 
 const commandTcpSend = (context, cb) => {
-    const len = context.argv.len;
-    const mtu = context.argv.mtu;
-
-    const lorem = new LoremIpsum({
-        sentencesPerParagraph: {
-            max: 100,
-            min: 100,
-        },
-        wordsPerSentence: {
-            max: 50,
-            min: 5,
-        },
-    });
+    const len = parseInt(context.argv.len);
+    const mtu = context.argv.mtu <= 0 ? 1 : parseInt(context.argv.mtu);
+    if (len <= 0) return cb(new Error('bad length'));
 
     makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
-        const send = (len, cb) => {
-            const thisLen = len < mtu ? len : mtu;
-            if (thisLen <= 0) return cb(null);
-
-            var text = '';
-            while (text.length < thisLen)
-                text += lorem.generateSentences().slice(0, thisLen - text.length);
-
-            tcpSend(context, text, err => {
-                if (err) return cb(err);
-                send(len - thisLen, cb);
-            });
-        };
-        send(len, onExecEnd);
+        tcpSendBig(context, generateText(len), mtu, onExecEnd);
     }, cb);
 };
 
@@ -653,30 +830,28 @@ const commandRebootDevice = (context, cb) => {
     timer = setTimeout(() => {
         context.device.removeListener('data', onData);
         cb(new Error('timeout'));
-    }, defaultScpiRespDelay);
+    }, context.timing.scpiRespDelay);
     context.device.on('data', onData);
     context.lineSender(scpi.rebootDevice);
 };
 
 /**
- * Since NB85 meter firmware on, the modem Rx/Tx PINs will be set as GPIOs
- * almost immediately after meter is powered up, in this state the AT
- * traffics to the modem cannot through. To solve this difficulty, I send
- * a SCPI command to turn the PINs back to UART mode just after they were
- * set as GPIOs and before the modem power-up sequence will be starting.
- * If I issue the SCPI command too earlier, the firmware's settings of
- * turning the PINs GPIO will come after me and overwrite my settings; If
- * I do it too later, the modem power-up sequence will start before my
- * setting, and the start-up sequence will be facing with GPIO pins, that
- * will cause the AT failure at its earlier stage, that in turn will fool
- * the firmware to make it change UART's baud to the next one. Once the
- * UART's baudrate was changed to a wrong one, there is no a SCPI command
- * can change it back until the next power cycle.
+ * Since NB85 meter firmware on, the modem Rx/Tx PINs have been set as GPIOs
+ * almost immediately after meter is powered up, in this state the AT traffics
+ * to the modem cannot through. To solve this difficulty, I send a SCPI command
+ * to turn the PINs back to UART mode just after they were set as GPIOs and
+ * before the modem power-up sequence will be starting.  If I issue the SCPI
+ * command too earlier, the firmware's settings of turning the PINs to GPIO will
+ * come after me and overwrite my settings; If I do it too later, the modem
+ * power-up sequence will start before my setting, and the start-up sequence
+ * will be facing with GPIO pins, that will cause the AT failure at its earlier
+ * stage, which in turn will fool the firmware to make it change UART's baud to
+ * the next one. Once the UART's baudrate was changed to a wrong one, there is
+ * no a SCPI command can change it back until the next power cycle.
  *
- * After the above described operations, the alogrithm will start a AT
- * command to test whether the modem is up working, if not success,
- * the whole operation will repeat with randomly adjusted timing until
- * success.
+ * After the above described operations, the alogrithm will start a AT command
+ * to test whether the modem is up working, if not success, the whole operation
+ * will repeat with randomly adjusted timing until success.
  */
 const commandUnlockNb85 = (context, cb) => {
     const fromRebootOkToEnableLoopBack = 2900; /* my measure: 2.878s */
@@ -694,7 +869,7 @@ const commandUnlockNb85 = (context, cb) => {
             makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
                 context.atSender({
                     command: 'at',
-                    timeout: defaultAtRespDelay,
+                    timeout: context.timing.atRespDelay,
                     expect: 'OK',
                 }, onExecEnd); 
             }, cb);
@@ -807,12 +982,17 @@ const argv = yargs(hideBin(process.argv))
         describe: 'maximum send/receive size of socket data',
         nargs: 1,
         type: 'number',
-        default: 1200,
+        default: maxMtu,
     })
     .option('optical', {
         describe: 'is using optical head',
         type: 'boolean',
         default: true,
+    })
+    .option('simulate', {
+        alias: 'm',
+        describe: 'the peer talker is a human played simulator',
+        type: 'boolean',
     })
     .command('ping', 'Test scpi connectivity by sending *IDN?', yargs => {
     }, makeCommandHandler(commandTest))
@@ -823,7 +1003,7 @@ const argv = yargs(hideBin(process.argv))
                 describe: 'status|on|off',
                 })
     }, makeCommandHandler(commandModemPower))
-    .command('modem-conf', 'Configure modem', yargs => {
+    .command('modem-config', 'Configure modem', yargs => {
         yargs
             .option('t', {
                 alias: 'network',
@@ -854,9 +1034,9 @@ const argv = yargs(hideBin(process.argv))
                 default: '',
             });
     }, makeCommandHandler(commandConfigModem))
-    .command('modem-info', 'Modem information, including network registration status', yargs => {
+    .command('modem-info', 'Modem/network information', yargs => {
     }, makeCommandHandler(commandModemInfo))
-    .command('pdp-activate', 'Activate PDP context. Do it only after network registered', yargs => {
+    .command('pdp-activate', 'Activate PDP context.', yargs => {
         yargs
             .option('c', {
                 alias: 'context-id',
@@ -866,11 +1046,48 @@ const argv = yargs(hideBin(process.argv))
                 default: 1,
             });
     }, makeCommandHandler(commandActivatePDP))
+    .command('tcp-ping', 'Send data to a server over TCP and wait for replies', yargs => {
+        yargs
+            .option('a', {
+                alias: 'address',
+                describe: 'desitination address in <IP>:<PORT>',
+                nargs: 1,
+                type: 'string',
+                demandOption: true,
+            })
+            .option('s', {
+                alias: 'size',
+                describe: 'size of each data message. (will be split at MTU size)',
+                nargs: 1,
+                type: 'number',
+                default: 64,
+            })
+            .option('n', {
+                alias: 'times',
+                describe: 'number of times to repeat',
+                nargs: 1,
+                type: 'number',
+            })
+            .option('-O', {
+                alias: 'timeout',
+                describe: 'receiving timeout (secs)',
+                nargs: 1,
+                type: 'number',
+                default: 8,
+            })
+            .option('y', {
+                alias: 'delay',
+                describe: 'inter message delay (secs)',
+                nargs: 1,
+                type: 'number',
+                default: 1.5,
+            })
+    }, makeCommandHandler(commandTcpPing))
     .command('tcp-open', 'Open the TCP conn', yargs => {
         yargs
             .option('a', {
                 alias: 'address',
-                describe: 'destination address <IP>:<PORT>',
+                describe: 'destination address in <IP>:<PORT>',
                 nargs: 1,
                 type: 'string',
                 demandOption: true,
@@ -882,7 +1099,7 @@ const argv = yargs(hideBin(process.argv))
         yargs
             .option('n', {
                 alias: 'len',
-                describe: 'length of data to send',
+                describe: 'length of data to send. (will be split at MTU size)',
                 nargs: 1,
                 type: 'number',
                 demandOption: true,
@@ -901,7 +1118,7 @@ const argv = yargs(hideBin(process.argv))
                 describe: 'on or off',
                 });
     }, makeCommandHandler(commandSciLoopback))
-    .command('send <line>', 'Send single line to the deivce', yargs => {
+    .command('send <line>', 'Send a scpi command to the deivce', yargs => {
         yargs
             .positional('line', {
                 type: 'string',
@@ -922,8 +1139,8 @@ const argv = yargs(hideBin(process.argv))
                     + ' When this option is not present, read commands from stdin.',
                 type: 'string',
             });
-    }, makeCommandHandler(commandSendAt))
-    .command('forward <status>', 'Turn on/off forwarding between modem and optical head', yargs => {
+    }, makeCommandHandler(commandRunAt))
+    .command('forward <status>', 'Turn on/off optical head forwarding', yargs => {
         yargs
             .positional('status', {
                 type: 'string',
