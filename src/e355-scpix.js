@@ -585,6 +585,8 @@ const commandSciLoopback = (context, cb) => {
 };
 
 const commandRunScpi = (context, cb) => {
+    const execDelay = 50;
+
     fileReducer(context, argv.file ? argv.file : '-', [], (line, cb) => {
         const tokens = line.split(';');
         cb({
@@ -601,7 +603,9 @@ const commandRunScpi = (context, cb) => {
                 cb(null);
             }, timeout, err => {
                 if (err) return cb(err);
-                execSpec(specs);
+                setTimeout(() => {
+                    execSpec(specs);
+                }, execDelay);
             });
         };
         execSpec(specs);
@@ -609,6 +613,8 @@ const commandRunScpi = (context, cb) => {
 };
 
 const commandRunAt = (context, cb) => {
+    const execDelay = 50;
+
     fileReducer(context, argv.file ? argv.file : '-', [], (line, cb) => {
         const tokens = line.split(';');
         cb({
@@ -623,7 +629,9 @@ const commandRunAt = (context, cb) => {
             const execSpec = specs => {
                 if (! specs.length) return onExecEnd(null);
                 context.atSender(specs.shift(), () => {
-                    execSpec(specs);
+                    setTimeout(() => {
+                        execSpec(specs);
+                    }, execDelay);
                 });
             };
             execSpec(specs);
