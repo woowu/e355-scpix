@@ -3,8 +3,10 @@ E355 SCPI Tool is a handy tool that makes it easier to access SCPI interface of 
 
 It gives you:
 
-* commands and (grouped) options (`my-program.js serve --port=5000`).
-* a dynamically generated help menu based on your arguments:
+* Easy access to meter scpi interface
+* High level scenario-based commands that auto your test
+* Easy way to play with the modem inside the meter
+* Unblock some version (NB85) of meter firmware which block the access to the modem
 
 ```
 e355-scpix [command]
@@ -38,7 +40,20 @@ Options:
   -h, --help     Show help                                             [boolean]
 ```
 
+## Installation
+
+1. Download and install [nodejs](https://nodejs.org/en) in your OS.
+2. Download this repo: git clone https://github.com/woowu/e355-scpix.git. (If
+   you have offline copy, you can skip the downloading and unzip the zip file
+   locally)
+3. Run `npm install` inside the cloned folder.
+4. Play with the tool with: `node src/e355-scpi.js`
+
 ## Examples
+
+Note: in all the examples below, the serial device is named /dev/ttyUSB0, which
+is the case in my Linux. In Windows, it should be, like COM3 or so.
+
 ```bash
 $ e355-scpix -d /dev/ttyUSB0 unlock-nb85
 > *IDN?
