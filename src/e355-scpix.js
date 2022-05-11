@@ -360,7 +360,10 @@ const tcpClose = (context, cb) => {
         timeout: context.timing.tcpCloseDelay,
         expect: ['OK\r\n', 'MODEM TIMEOUT'],
     }, (err, resp) => {
-        cb(err);
+        /* the modem quit often returns nothing when doing +qiclose, so I
+         * discard the error.
+         */
+        cb(null);
     });
 };
 
@@ -405,9 +408,9 @@ const tcpRecv = (context, cb) => {
         expect: tail,
     }, (err, resp) => {
         if (err) return cb(err);
-        if (resp.search(head)
+        if (resp.search(head) < 0
             || resp.slice(resp.length - tail.length) != tail)
-            return cb(new Error('01' +  formatErrMessage))
+            return cb(new Error(formatErrMessage))
 
         var data = resp.slice(resp.search(head) + headLen
             , resp.length - tail.length);
@@ -418,15 +421,12 @@ const tcpRecv = (context, cb) => {
             len = len * 10 + (data[0] - '0');
             data = data.slice(1);
         }
-        if (len && data.slice(0, 2) != '\r\n')
-            return cb(new Error('02' + formatErrMessage))
-        if (len) data = data.slice(2)
-        if (len != data.length) {
-            console.log('03', len, data.length, data);
-            return cb(new Error('03' + formatErrMessage))
-        }
-
-        cb(null, data);
+        if (data.slice(0, 2) != '\r\n')
+            return cb(new Error(formatErrMessage))
+        data = data.slice(2)
+        if (data.length < len)
+            return cb(new Error(formatErrMessage))
+        cb(null, data.slice(0, len));
     });
 };
 
@@ -747,6 +747,7 @@ const commandTcpOpen = (context, cb) => {
 };
 
 const commandTcpPing = (context, cb) => {
+    const firstSendDelay = 2000;
     var [ip, port] = context.argv.address.split(':');
     if (! ip || ! port) return cb(new Error('bad address'));
     var repeats = context.argv.n ? parseInt(context.argv.n) : 0;
@@ -760,6 +761,14 @@ const commandTcpPing = (context, cb) => {
     const mtu = context.argv.mtu <= 0 ? 1 : parseInt(context.argv.mtu);
 
     makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+        const stats = {
+            sentCnt: 0,
+            sentBytes: 0,
+            recvCnt: 0,
+            recvBytes: 0,
+        };
+        const startTime = new Date();
+
         tcpOpen(context, ip, +port, err => {
             if (err) return onExecEnd(err);
             const pingNext = cb => {
@@ -767,6 +776,9 @@ const commandTcpPing = (context, cb) => {
                 tcpSendBig(context, sent, mtu, err => {
                     const recvDelay = 500;
                     if (err) return cb(err);
+                    ++stats.sentCnt;
+                    stats.sentBytes += sent.length;
+
                     var received = '';
                     const recvNext = cb => {
                         tcpRecv(context, (err, data) => {
@@ -778,6 +790,10 @@ const commandTcpPing = (context, cb) => {
                              */
                             if (received.length && ! data.length) {
                                 console.log('<', received);
+                                if (received == sent) {
+                                    ++stats.recvCnt;
+                                    stats.recvBytes += received.length;
+                                }
                                 return cb(received != sent
                                     ? new Error('received data mismatched')
                                     : null);
@@ -797,10 +813,17 @@ const commandTcpPing = (context, cb) => {
                     });
                 });
             };
-            pingNext(err => {
-                if (err) console.error(err.message);
-                tcpClose(context, onExecEnd);
-            });
+            setTimeout(() => {
+                pingNext(err => {
+                    if (err) console.error(err.message);
+                    tcpClose(context, err => {
+                        onExecEnd(err);
+                        console.log(`sent ${stats.sentCnt} messages, ttl ${stats.sentBytes} bytes`);
+                        console.log(`recved ${stats.recvCnt} messages, ttl ${stats.recvBytes} bytes`);
+                        console.log(`used ${(new Date() - startTime)/1000} secs`);
+                    });
+                });
+            }, firstSendDelay);
         });
     }, cb);
 };
@@ -1043,7 +1066,7 @@ const argv = yargs(hideBin(process.argv))
                 type: 'string',
                 default: '',
             })
-            .option('u', {
+            .option('U', {
                 alias: 'username',
                 describe: 'username',
                 nargs: 1,
