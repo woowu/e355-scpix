@@ -185,3 +185,152 @@ $ socat -v -x TCP4-LISTEN:9005,fork EXEC:cat
 --
 
 ```
+
+```bash
+~/coding/e355-scpix $ node src/e355-scpix.js -d /dev/ttyUSB0 tcp-ping -a 116.6.51.98:9005 -s 200 -n 5
+> SER:CON ON
+> at+qiopen=1,0,"TCP","116.6.51.98",9005,0,0
+< OK *
+send data. len 200
+> at+qisend=0,200
+< MODEM > *
+> Adipisicing veniam ex proident ad ea ullamco aliqua enim voluptate pariatur sunt aute proident Lorem do irure ullamco exercitation quis veniam aute
+ officia cillum Lorem ipsum sit duis ut nisi sunt et
+< SEND OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 200
+Adipisicing veniam ex proident ad ea ullamco aliqua enim voluptate pariatur sunt aute proident Lorem do irure ullamco exercitation quis veniam aute o
+fficia cillum Lorem ipsum sit duis ut nisi sunt et
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+< Adipisicing veniam ex proident ad ea ullamco aliqua enim voluptate pariatur sunt aute proident Lorem do irure ullamco exercitation quis veniam aute
+ officia cillum Lorem ipsum sit duis ut nisi sunt et
+send data. len 200
+> at+qisend=0,200
+< MODEM > *
+> Est est magna proident nisi qui incididunt ipsum proident ut magna laborum eu enim mollit sunt sit. In nisi ipsum ex incididunt non fugiat aliqua c
+ommodo et pariatur cillum tempor laborum laborum amet
+< SEND OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 200
+Est est magna proident nisi qui incididunt ipsum proident ut magna laborum eu enim mollit sunt sit. In nisi ipsum ex incididunt non fugiat aliqua com
+modo et pariatur cillum tempor laborum laborum amet
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+< Est est magna proident nisi qui incididunt ipsum proident ut magna laborum eu enim mollit sunt sit. In nisi ipsum ex incididunt non fugiat aliqua c
+ommodo et pariatur cillum tempor laborum laborum amet
+send data. len 200
+> at+qisend=0,200
+< MODEM > *
+> Velit dolor amet laborum cillum nostrud ipsum commodo est commodo qui esse occaecat nostrud ullamco. Magna enim dolore nostrud ea tempor ipsum comm
+odo dolore laboris ad ipsum nulla exercitation deseru
+< SEND OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 200
+Velit dolor amet laborum cillum nostrud ipsum commodo est commodo qui esse occaecat nostrud ullamco. Magna enim dolore nostrud ea tempor ipsum commod
+o dolore laboris ad ipsum nulla exercitation deseru
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+< Velit dolor amet laborum cillum nostrud ipsum commodo est commodo qui esse occaecat nostrud ullamco. Magna enim dolore nostrud ea tempor ipsum comm
+odo dolore laboris ad ipsum nulla exercitation deseru
+send data. len 200
+> at+qisend=0,200
+< MODEM > *
+> Consectetur anim voluptate cillum sint elit id sint dolor commodo consequat tempor dolor veniam consectetur nulla officia culpa velit anim exercita
+tion pariatur dolore qui nostrud minim elit sit elit
+< SEND OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 200
+Consectetur anim voluptate cillum sint elit id sint dolor commodo consequat tempor dolor veniam consectetur nulla officia culpa velit anim exercitati
+on pariatur dolore qui nostrud minim elit sit elit
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+< Consectetur anim voluptate cillum sint elit id sint dolor commodo consequat tempor dolor veniam consectetur nulla officia culpa velit anim exercita
+tion pariatur dolore qui nostrud minim elit sit elit
+send data. len 200
+> at+qisend=0,200
+< MODEM > *
+> Fugiat dolor laboris consequat eiusmod officia qui deserunt elit magna labore in incididunt eu ut dolore Lorem quis est consequat voluptate. Nisi n
+ulla amet Lorem mollit non in non laboris minim paria
+< SEND OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+> at+qird=0,1006
+< +QIRD: 200
+Fugiat dolor laboris consequat eiusmod officia qui deserunt elit magna labore in incididunt eu ut dolore Lorem quis est consequat voluptate. Nisi nul
+la amet Lorem mollit non in non laboris minim paria
+
+OK *
+> at+qird=0,1006
+< +QIRD: 0
+
+OK *
+< Fugiat dolor laboris consequat eiusmod officia qui deserunt elit magna labore in incididunt eu ut dolore Lorem quis est consequat voluptate. Nisi n
+ulla amet Lorem mollit non in non laboris minim paria
+> at+qiclose=0
+[MODEM TIMEOUT]
+[MODEM TIMEOUT]
+< MODEM TIMEOUT *
+> +++
+sent 5 messages, ttl 1000 bytes
+recved 5 messages, ttl 1000 bytes
+used 32.263 secs
+```
