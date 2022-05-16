@@ -20,6 +20,7 @@ const scpi = {
     optoForwardingOn: 'SER:CON ON',
     optoForwardingOff: '+++',
     rebootDevice: 'PWRState:MONVolt 1600',
+    setForwardingTimeout: 'SERial:TIMEout 8000',
 };
 
 /**
@@ -372,7 +373,7 @@ const tcpSend = (context, text, cb) => {
     context.atSender({
         command: `at+qisend=0,${text.length}`,
         timeout: context.timing.atRespDelay,
-        expect: ['> \r\n', 'RESPONSE \r\n', 'RESPONSE\r\n'],
+        expect: ['> \r\n', 'PROMPT\r\n'],
     }, (err, resp) => {
         if (err) return cb(err);
         context.atSender({
@@ -703,11 +704,16 @@ const commandConfigModem = (context, cb) => {
         });
     };
 
-    atScriptRunner(init, context, err => {
-        if (err) return cb(err);
-        makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
-            confSleepMode(onExecEnd);
-        }, cb);
+    runScpi(context, scpi.setForwardingTimeout, (response, cb) => {
+        if (response) console.log('<', response);
+        cb(null);
+    }, () => {
+        atScriptRunner(init, context, err => {
+            if (err) return cb(err);
+            makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+                confSleepMode(onExecEnd);
+            }, cb);
+        });
     });
 };
 
@@ -760,72 +766,77 @@ const commandTcpPing = (context, cb) => {
     if (interMessageDelay < 0) return cb(new Error('bad delay time'));
     const mtu = context.argv.mtu <= 0 ? 1 : parseInt(context.argv.mtu);
 
-    makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
-        const stats = {
-            sentCnt: 0,
-            sentBytes: 0,
-            recvCnt: 0,
-            recvBytes: 0,
-        };
-        const startTime = new Date();
-
-        tcpOpen(context, ip, +port, err => {
-            if (err) return onExecEnd(err);
-            const pingNext = cb => {
-                const sent = generateText(size);
-                tcpSendBig(context, sent, mtu, err => {
-                    const recvDelay = 500;
-                    if (err) return cb(err);
-                    ++stats.sentCnt;
-                    stats.sentBytes += sent.length;
-
-                    var received = '';
-                    const recvNext = cb => {
-                        tcpRecv(context, (err, data) => {
-                            if (err) return cb(err);
-                            /* if we've yet received anything, we keep waiting;
-                             * if we've already received something then got an
-                             * empty data, that mean EOF and we should stop
-                             * receiving.
-                             */
-                            if (received.length && ! data.length) {
-                                console.log('<', received);
-                                if (received == sent) {
-                                    ++stats.recvCnt;
-                                    stats.recvBytes += received.length;
-                                }
-                                return cb(received != sent
-                                    ? new Error('received data mismatched')
-                                    : null);
-                            }
-                            received += data;
-                            setTimeout(() => {
-                                recvNext(cb);
-                            }, recvDelay);
-                        });
-                    };
-                    recvNext(err => {
-                        if (err) return cb(err);
-                        setTimeout(() => {
-                            if (--repeats == 0) return cb(null);
-                            pingNext(cb);
-                        }, interMessageDelay);
-                    });
-                });
+    runScpi(context, scpi.setForwardingTimeout, (response, cb) => {
+        if (response) console.log('<', response);
+        cb(null);
+    }, () => {
+        makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+            const stats = {
+                sentCnt: 0,
+                sentBytes: 0,
+                recvCnt: 0,
+                recvBytes: 0,
             };
-            setTimeout(() => {
-                pingNext(err => {
-                    if (err) console.error(err.message);
-                    tcpClose(context, err => {
-                        onExecEnd(err);
-                        console.log(`sent ${stats.sentCnt} messages, ttl ${stats.sentBytes} bytes`);
-                        console.log(`recved ${stats.recvCnt} messages, ttl ${stats.recvBytes} bytes`);
-                        console.log(`used ${(new Date() - startTime)/1000} secs`);
+            const startTime = new Date();
+
+            tcpOpen(context, ip, +port, err => {
+                if (err) return onExecEnd(err);
+                const pingNext = cb => {
+                    const sent = generateText(size);
+                    tcpSendBig(context, sent, mtu, err => {
+                        const recvDelay = 500;
+                        if (err) return cb(err);
+                        ++stats.sentCnt;
+                        stats.sentBytes += sent.length;
+
+                        var received = '';
+                        const recvNext = cb => {
+                            tcpRecv(context, (err, data) => {
+                                if (err) return cb(err);
+                                /* if we've yet received anything, we keep waiting;
+                                 * if we've already received something then got an
+                                 * empty data, that mean EOF and we should stop
+                                 * receiving.
+                                 */
+                                if (received.length && ! data.length) {
+                                    console.log('<', received);
+                                    if (received == sent) {
+                                        ++stats.recvCnt;
+                                        stats.recvBytes += received.length;
+                                    }
+                                    return cb(received != sent
+                                        ? new Error('received data mismatched')
+                                        : null);
+                                }
+                                received += data;
+                                setTimeout(() => {
+                                    recvNext(cb);
+                                }, recvDelay);
+                            });
+                        };
+                        recvNext(err => {
+                            if (err) return cb(err);
+                            setTimeout(() => {
+                                if (--repeats == 0) return cb(null);
+                                pingNext(cb);
+                            }, interMessageDelay);
+                        });
                     });
-                });
-            }, firstSendDelay);
-        });
-    }, cb);
+                };
+                setTimeout(() => {
+                    pingNext(err => {
+                        if (err) console.error(err.message);
+                        tcpClose(context, err => {
+                            onExecEnd(err);
+                            console.log(`sent ${stats.sentCnt} messages, ttl ${stats.sentBytes} bytes`);
+                            console.log(`recved ${stats.recvCnt} messages, ttl ${stats.recvBytes} bytes`);
+                            console.log(`used ${(new Date() - startTime)/1000} secs`);
+                        });
+                    });
+                }, firstSendDelay);
+            });
+        }, cb);
+    });
 };
 
 const commandTcpClose = (context, cb) => {
@@ -1010,7 +1021,7 @@ const commandUnlockNb85 = (context, cb) => {
 };
 
 const argv = yargs(hideBin(process.argv))
-    .version('0.1.2')
+    .version('0.1.3')
     .option('d', {
         alias: 'device',
         describe: 'Serial device name',
@@ -1192,5 +1203,6 @@ const argv = yargs(hideBin(process.argv))
     }, makeCommandHandler(commandForward))
     .help()
     .alias('help', 'h')
+    .alias('version', 'v')
     .argv;
 
