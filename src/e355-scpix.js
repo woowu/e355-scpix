@@ -372,7 +372,7 @@ const tcpSend = (context, text, cb) => {
     context.atSender({
         command: `at+qisend=0,${text.length}`,
         timeout: context.timing.atRespDelay,
-        expect: '> \r\n',
+        expect: ['> \r\n', 'RESPONSE \r\n', 'RESPONSE\r\n'],
     }, (err, resp) => {
         if (err) return cb(err);
         context.atSender({
