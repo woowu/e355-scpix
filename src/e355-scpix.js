@@ -44,7 +44,7 @@ const scpi = {
  * We just pick up the minimum of TX MTU and RX MTU, that is 1014 as our max MTU
  * size.
  */
-const maxMtu = /*1006*/ 600;
+const maxMtu = 1006;
 const maxTimeout = 2**31 - 1;
 const realTiming = {
     atRespDelay: 1000,
@@ -1073,7 +1073,7 @@ const commandUnlockNb85 = (context, cb) => {
 };
 
 const argv = yargs(hideBin(process.argv))
-    .version('1.1.0')
+    .version('1.1.1')
     .option('d', {
         alias: 'device',
         describe: 'Serial device name',
@@ -1092,7 +1092,7 @@ const argv = yargs(hideBin(process.argv))
         describe: 'Maximum send/receive size of socket data',
         nargs: 1,
         type: 'number',
-        default: maxMtu,
+        default: 600,
     })
     .option('optical', {
         describe: 'Use optical head',
