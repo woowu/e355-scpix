@@ -44,7 +44,7 @@ const scpi = {
  * We just pick up the minimum of TX MTU and RX MTU, that is 1014 as our max MTU
  * size.
  */
-const maxMtu = 1006;
+const maxMtu = /*1006*/ 600;
 const maxTimeout = 2**31 - 1;
 const realTiming = {
     atRespDelay: 1000,
@@ -362,9 +362,11 @@ const tcpSend = (context, text, cb) => {
     context.atSender({
         command: `at+qisend=0,${text.length}`,
         timeout: context.timing.atRespDelay,
-        expect: ['> \r\n', 'PROMPT\r\n', 'PROMPT \r\n'],
+        expect: ['> \r\n', 'PROMPT\r\n', 'PROMPT \r\n', 'ERROR', 'OVERFLOW'],
     }, (err, resp) => {
         if (err) return cb(err);
+        if (resp.search('ERROR') >= 0 || resp.search('OVERFLOW') >= 0)
+            return cb(new Error('modem error: ' + resp.trim()));
         context.atSender({
             command: text,
             timeout: context.timing.tcpSendTimeout,
@@ -781,12 +783,13 @@ const commandTcpPing = (context, cb) => {
 
             tcpOpen(context, ip, +port, err => {
                 if (err) return onExecEnd(err);
-                const pingNext = cb => {
+                const pingNext = (cnt, cb) => {
+                    if (! cnt) return cb(null, cnt);
                     const sent = generateText(size);
                     tcpSendBig(context, sent, mtu, err => {
                         const recvDelay = 200;
-                        if (err) return cb(err);
                         ++stats.sentCnt;
+                        if (err) return cb(err, cnt - 1);
                         stats.sentBytes += sent.length;
 
                         var received = '';
@@ -818,9 +821,9 @@ const commandTcpPing = (context, cb) => {
                                 )
                                     return waitAndRecvNext();
 
+                                ++stats.recvCnt;
+                                stats.recvBytes += received.length;
                                 if (received == sent) {
-                                    ++stats.recvCnt;
-                                    stats.recvBytes += received.length;
                                     if (context.argv.verbose)
                                         console.log(`recved bytes so far: ${stats.recvBytes}`);
                                 } else {
@@ -833,23 +836,39 @@ const commandTcpPing = (context, cb) => {
                             });
                         };
                         recvNext(new Date(), err => {
-                            if (err) return cb(err);
+                            if (err) return cb(err, cnt - 1);
                             setTimeout(() => {
-                                if (--repeats == 0) return cb(null);
-                                pingNext(cb);
+                                pingNext(cnt - 1, cb);
                             }, interMessageDelay);
                         });
                     });
                 };
                 setTimeout(() => {
-                    pingNext(err => {
-                        if (err) console.error(err.message);
-                        tcpClose(context, err => {
-                            onExecEnd(err);
-                            console.log(`sent ${stats.sentCnt} messages, ttl ${stats.sentBytes} bytes`);
-                            console.log(`recved ${stats.recvCnt} messages, ttl ${stats.recvBytes} bytes`);
-                            console.log(`used ${(new Date() - startTime)/1000} secs`);
+                    const recoverDelay = 2000;
+                    const reopenDelay = 1000;
+                    const retry = (remaining, cb) => {
+                        if (! remaining) return cb(null);
+                        pingNext(remaining, (err, remaining) => {
+                            if (err) console.error(err.message);
+                            setTimeout(() => {
+                                tcpClose(context, err => {
+                                    if (! remaining) return cb(err);
+                                    setTimeout(() => {
+                                        tcpOpen(context, ip, +port, err => {
+                                            if (err) return cb(err);
+                                            retry(remaining, cb);
+                                        });
+                                    }, reopenDelay);
+                                });
+                            }, recoverDelay);
                         });
+                    };
+                    retry(repeats, err => {
+                        if (err) console.error(err.message);
+                        onExecEnd(err);
+                        console.log(`sent ${stats.sentCnt} messages, ttl ${stats.sentBytes} bytes`);
+                        console.log(`recved ${stats.recvCnt} messages, ttl ${stats.recvBytes} bytes`);
+                        console.log(`used ${(new Date() - startTime)/1000} secs`);
                     });
                 }, firstSendDelay);
             });
@@ -1054,7 +1073,7 @@ const commandUnlockNb85 = (context, cb) => {
 };
 
 const argv = yargs(hideBin(process.argv))
-    .version('1.0.0')
+    .version('1.1.0')
     .option('d', {
         alias: 'device',
         describe: 'Serial device name',
