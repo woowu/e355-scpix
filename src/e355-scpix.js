@@ -307,7 +307,11 @@ const makeAtEnvironment = (lineSender, execCb, onClose) => {
     });
 };
 
-const atScriptRunner = (script, context, cb) => {
+const atScriptRunner = (script, context, alreadyInAt, cb) => {
+    if (typeof alreadyInAt == 'function') {
+        cb = alreadyInAt;
+        alreadyInAt = false;
+    }
     const interCommandDelay = 200;
 
     if (! Array.isArray(script)) script = [script];
@@ -329,9 +333,26 @@ const atScriptRunner = (script, context, cb) => {
         });
     };
 
+    if (alreadyInAt) return exec(cb);
     makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
         exec(onExecEnd);
     }, cb);
+};
+
+const renewPDP = (context, cid, connId, apn, user, password, cb) => {
+    const script = [
+        [`at+qiclose=${connId},3`
+           , context.timing.tcpCloseDelay, 'OK\r\n'],
+        [`at+qideact=${cid}`
+           , 2 * context.timing.atRespDelay, 'OK\r\n'],
+        [`at+qicsgp=1,1,"${apn}","${user}","${password}",0`
+           , context.timing.atRespDelay, 'OK\r\n'],
+        [`at+qiact=${cid}`
+           , 3 * context.timing.atRespDelay, 'OK\r\n'],
+        [`at+qiact?`
+            , 2 * context.timing.atRespDelay, 'OK\r\n'],
+    ];
+    atScriptRunner(script, context, cb);
 };
 
 const tcpOpen = (context, ip, port, cb) => {
@@ -357,12 +378,17 @@ const tcpClose = (context, cb) => {
     });
 };
 
-const tcpSend = (context, text, cb) => {
+const tcpSend = (context, connId, text, cb) => {
     console.log('send data.', 'len', text.length);
     context.atSender({
-        command: `at+qisend=0,${text.length}`,
+        command: `at+qisend=${connId},${text.length}`,
         timeout: context.timing.atRespDelay,
-        expect: ['> \r\n', 'PROMPT\r\n', 'PROMPT \r\n', 'ERROR', 'OVERFLOW'],
+        expect: [
+            '> \r\n',
+            'PROMPT\r\n', 'PROMPT \r\n',
+            'ERROR\r\n', 'ERROR \r\n',
+            'OVERFLOW\r\n', 'OVERFLOW \r\n',
+        ],
     }, (err, resp) => {
         if (err) return cb(err);
         if (resp.search('ERROR') >= 0 || resp.search('OVERFLOW') >= 0)
@@ -377,12 +403,53 @@ const tcpSend = (context, text, cb) => {
     });
 };
 
-const tcpSendBig = (context, text, mtu, cb) => {
+const tcpSendBig = (context, connId, text, mtu, cb) => {
+    const waitAck = (repeatCnt, cb) => {
+        const queryDelay = 500;
+
+        if (repeatCnt > 30) return cb(new Error('no ack for a long time'));
+
+        const queryUnAckedBytes = cb => {
+            context.atSender({
+                command: `at+qisend=${connId},0`,
+                timeout: 3 * context.timing.atRespDelay,
+                expect: [
+                    '\r\nOK\r\n',
+                    'ERROR\r\n',
+                ],
+            }, (err, resp) => {
+                if (err) return cb(err);
+                const pos = resp.search('QISEND:');
+                if (pos < 0)
+                    return cb(new Error(
+                        'bad response when querying ack status (01): ' + resp));
+                const str = resp.split(',')[2];
+                if (str === null || str === undefined)
+                    return cb(new Error(
+                        'bad response when querying ack status (02): ' + resp));
+                const unAcked = parseInt(str);
+                if (isNaN(unAcked))
+                    return cb(new Error(
+                        'bad response when querying ack status (03): ' + resp));
+                cb(null, unAcked);
+            });
+        };
+        setTimeout(() => {
+            queryUnAckedBytes((err, unAcked) => {
+                if (err) return cb(err);
+                if (! unAcked) return cb(null);
+                waitAck(repeatCnt + 1, cb);
+            });
+        }, repeatCnt ? 2 * queryDelay : queryDelay);
+    };
     const send = (text, cb) => {
         if (! text.length) return cb(null);
-        tcpSend(context, text.slice(0, mtu), err => {
+        tcpSend(context, connId, text.slice(0, mtu), err => {
             if (err) return cb(err);
-            send(text.slice(mtu), cb);
+            waitAck(0, err => {
+                if (err) return cb(err);
+                send(text.slice(mtu), cb);
+            });
         });
     };
     send(text, cb);
@@ -729,14 +796,8 @@ const commandModemInfo = (context, cb) => {
 };
 
 const commandActivatePDP = (context, cb) => {
-    var cid = context.argv.c;
-    const script = [
-        [ `at+qiclose=0,3`, 2000, 'OK\r\n' ],
-        [ `at+qideact=${cid}`, 3000, 'OK\r\n' ],
-        [ `at+qiact=${cid}`, 2000, 'OK\r\n' ],
-        [ `at+qiact?`, 2500, 'OK\r\n' ],
-    ];
-    atScriptRunner(script, context, cb);
+    renewPDP(context, context.argv.cid, 0, context.argv.apn, context.username
+        , context.password, cb);
 };
 
 const commandTcpOpen = (context, cb) => {
@@ -767,6 +828,8 @@ const commandTcpPing = (context, cb) => {
     const interMessageDelay = context.argv.delay * 1000;
     if (interMessageDelay < 0) return cb(new Error('bad delay time'));
     const mtu = context.argv.mtu <= 0 ? 1 : parseInt(context.argv.mtu);
+    const cid = 1;
+    const connId = 0;
 
     const atExec = (err, onExecEnd) => {
         const stats = {
@@ -777,106 +840,147 @@ const commandTcpPing = (context, cb) => {
         };
         const startTime = new Date();
 
-        tcpOpen(context, ip, +port, err => {
-            if (err) return onExecEnd(err);
-            const pingNext = (cnt, cb) => {
-                if (! cnt) return cb(null, cnt);
-                const sent = generateText(size);
-                tcpSendBig(context, sent, mtu, err => {
-                    const recvDelay = 200;
-                    ++stats.sentCnt;
-                    if (err) return cb(err, cnt - 1);
-                    stats.sentBytes += sent.length;
+        const pingNext = (cnt, cb) => {
+            if (! cnt) return cb(null, cnt);
+            console.log('TCP ping, remaining count', cnt);
+            const sent = generateText(size);
+            tcpSendBig(context, connId, sent, mtu, err => {
+                const recvDelay = 200;
+                ++stats.sentCnt;
+                if (err) return cb(err, cnt - 1);
+                stats.sentBytes += sent.length;
 
-                    var received = '';
-                    const recvNext = (startTime, cb) => {
-                        const waitAndRecvNext = () => {
-                            setTimeout(() => {
-                                recvNext(startTime, cb);
-                            }, recvDelay);
-                        };
-                        tcpRecv(context, (err, data) => {
-                            if (err) return cb(err);
-                            if (context.argv.verbose)
-                                console.log(`received len ${data.length}`, data);
-                            received += data;
-
-                            /* As long as data is still coming, I will not
-                             * stop;
-                             */
-                            if (data.length)
-                                return waitAndRecvNext();
-
-                            /* As long as I still have time and data is
-                             * still short than what is expected, I will not
-                             * stop.
-                             */
-                            if (received.length < sent.length
-                                && new Date() - startTime
-                                    < context.timing.tcpPingDataWaitTimeout
-                            )
-                                return waitAndRecvNext();
-
-                            ++stats.recvCnt;
-                            stats.recvBytes += received.length;
-                            if (received == sent) {
-                                if (context.argv.verbose)
-                                    console.log(`recved bytes so far: ${stats.recvBytes}`);
-                            } else {
-                                console.log(`receiving mismatched. len ${received.length}:`);
-                                console.log(received);
-                            }
-                            return cb(received != sent
-                                ? new Error('received data mismatched')
-                                : null);
-                        });
+                var received = '';
+                const recvNext = (startTime, cb) => {
+                    const waitAndRecvNext = () => {
+                        setTimeout(() => {
+                            recvNext(startTime, cb);
+                        }, recvDelay);
                     };
-                    recvNext(new Date(), err => {
-                        if (err) return cb(err, cnt - 1);
-                        setTimeout(() => {
-                            pingNext(cnt - 1, cb);
-                        }, interMessageDelay);
-                    });
-                });
-            };
-            const startSend = () => {
-                const recoverDelay = 2000;
-                const reopenDelay = 1000;
-                const resume = (remaining, cb) => {
-                    if (! remaining) return cb(null);
-                    pingNext(remaining, (err, remaining) => {
-                        if (err) console.error(err.message);
-                        setTimeout(() => {
-                            tcpClose(context, err => {
-                                if (! remaining) return cb(err);
-                                setTimeout(() => {
-                                    tcpOpen(context, ip, +port, err => {
-                                        if (err) return cb(err);
-                                        resume(remaining, cb);
-                                    });
-                                }, reopenDelay);
-                            });
-                        }, recoverDelay);
+                    tcpRecv(context, (err, data) => {
+                        if (err) return cb(err);
+                        if (context.argv.verbose)
+                            console.log(`received len ${data.length}`, data);
+                        received += data;
+
+                        /* As long as data is still coming, I will not
+                         * stop;
+                         */
+                        if (data.length)
+                            return waitAndRecvNext();
+
+                        /* As long as I still have time and data is
+                         * still short than what is expected, I will not
+                         * stop.
+                         */
+                        if (received.length < sent.length
+                            && new Date() - startTime
+                                < context.timing.tcpPingDataWaitTimeout
+                        )
+                            return waitAndRecvNext();
+
+                        ++stats.recvCnt;
+                        stats.recvBytes += received.length;
+                        if (received == sent) {
+                            if (context.argv.verbose)
+                                console.log(`recved bytes so far: ${stats.recvBytes}`);
+                        } else {
+                            console.log(`receiving mismatched. len ${received.length}:`);
+                            console.log(received);
+                        }
+                        if (received == sent)
+                            console.log('Ok, send/recv matched');
+                        return cb(received != sent
+                            ? new Error('received data mismatched')
+                            : null);
                     });
                 };
-                resume(repeats, err => {
-                    if (err) console.error(err.message);
-                    onExecEnd(err);
-                    console.log(`sent ${stats.sentCnt} messages, ttl ${stats.sentBytes} bytes`);
-                    console.log(`recved ${stats.recvCnt} messages, ttl ${stats.recvBytes} bytes`);
-                    console.log(`used ${(new Date() - startTime)/1000} secs`);
+                recvNext(new Date(), err => {
+                    if (err) return cb(err, cnt - 1);
+                    setTimeout(() => {
+                        pingNext(cnt - 1, cb);
+                    }, interMessageDelay);
+                });
+            });
+        };
+
+        const startPing = () => {
+            const recoverDelay = 2000;
+            const reopenDelay = 2000;
+
+            const printStatus = cb => {
+                console.log('query PDP and socket status');
+                const script = [
+                    [ `at+qisend=${connId},0`, 2 * context.timing.atRespDelay, 'OK\r\n' ],
+                    [ `at+qistate=0,${cid}`, 2 * context.timing.atRespDelay, 'OK\r\n' ],
+                    [ `at+qistate=1,${connId}`, 2 * context.timing.atRespDelay, 'OK\r\n' ],
+                ];
+                atScriptRunner(script, context, true, cb);
+            };
+
+            const recover = cb => {
+                console.log('Recover possible socket error');
+                tcpClose(context, err => {
+                    setTimeout(() => {
+                        tcpOpen(context, ip, +port, cb);
+                    }, reopenDelay);
                 });
             };
-            setTimeout(startSend, firstSendDelay);
+
+            const pingUntilFail = (remainedPings, cb) => {
+                pingNext(remainedPings, (err, remainedPings) => {
+                    const handleRemainings = () => {
+                        setTimeout(() => {
+                            recover(err => {
+                                if (err) return cb(err);
+                                setTimeout(() => {
+                                    pingUntilFail(remainedPings, cb);
+                                }, firstSendDelay);
+                            });
+                        }, recoverDelay);
+                    };
+
+                    if (err) {
+                        console.error(err.message);
+                        printStatus(() => {
+                            if (remainedPings)
+                                handleRemainings();
+                            else
+                                cb(null);
+                        });
+                        return;
+                    }
+                    if (! remainedPings) return cb(null);
+                    handleRemainings();
+                });
+            };
+
+            pingUntilFail(repeats, err => {
+                if (err) console.error(err.message);
+                onExecEnd(err);
+                console.log(`sent ${stats.sentCnt} messages, ttl ${stats.sentBytes} bytes`);
+                console.log(`recved ${stats.recvCnt} messages, ttl ${stats.recvBytes} bytes`);
+                console.log(`used ${(new Date() - startTime)/1000} secs`);
+            });
+        };
+
+        tcpOpen(context, ip, +port, err => {
+            if (err) return onExecEnd(err);
+            setTimeout(startPing, firstSendDelay);
         });
     };
 
-    runScpi(context, scpi.setForwardingTimeout, (response, cb) => {
-        if (response) console.log('<', response);
-        cb(null);
-    }, () => {
-        makeAtEnvironment(context.lineSender, atExec, cb);
-    });
+    renewPDP(context, cid, connId, context.argv.apn, context.argv.username
+        , context.argv.password, err => {
+            if (err) return cb(err);
+            runScpi(context, scpi.setForwardingTimeout, (response, cb) => {
+                if (response) console.log('<', response);
+                cb(null);
+            }, () => {
+                makeAtEnvironment(context.lineSender, atExec, cb);
+            });
+        }
+    );
 };
 
 const commandTcpClose = (context, cb) => {
@@ -900,7 +1004,7 @@ const commandTcpSend = (context, cb) => {
         cb(null);
     }, () => {
         makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
-            tcpSendBig(context, generateText(len), mtu, onExecEnd);
+            tcpSendBig(context, 0, generateText(len), mtu, onExecEnd);
         }, cb);
     });
 };
@@ -1076,7 +1180,7 @@ const commandUnlockNb85 = (context, cb) => {
 };
 
 const argv = yargs(hideBin(process.argv))
-    .version('1.1.2')
+    .version('1.1.3-pre1')
     .option('d', {
         alias: 'device',
         describe: 'Serial device name',
@@ -1089,6 +1193,27 @@ const argv = yargs(hideBin(process.argv))
         nargs: 1,
         type: 'number',
         default: 9600,
+    })
+    .option('A', {
+        alias: 'apn',
+        describe: 'Network access point name (APN)',
+        nargs: 1,
+        type: 'string',
+        default: '',
+    })
+    .option('U', {
+        alias: 'username',
+        describe: 'username',
+        nargs: 1,
+        type: 'string',
+        default: '',
+    })
+    .option('p', {
+        alias: 'password',
+        describe: 'password',
+        nargs: 1,
+        type: 'string',
+        default: '',
     })
     .option('u', {
         alias: 'mtu',
@@ -1128,27 +1253,6 @@ const argv = yargs(hideBin(process.argv))
                 nargs: 1,
                 type: 'string',
                 default: 'NBIoT',
-            })
-            .option('a', {
-                alias: 'apn',
-                describe: 'Network access point name (APN)',
-                nargs: 1,
-                type: 'string',
-                default: '',
-            })
-            .option('U', {
-                alias: 'username',
-                describe: 'username',
-                nargs: 1,
-                type: 'string',
-                default: '',
-            })
-            .option('p', {
-                alias: 'password',
-                describe: 'password',
-                nargs: 1,
-                type: 'string',
-                default: '',
             });
     }, makeCommandHandler(commandConfigModem))
     .command('modem-info', 'Modem/network information', yargs => {
