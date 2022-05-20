@@ -6,7 +6,7 @@ const { hideBin } = require('yargs/helpers');
 const net = require('node:net');
 
 const argv = yargs(hideBin(process.argv))
-    .version('0.1.0')
+    .version('1.0.0')
     .option('p', {
         alias: 'port',
         describe: 'tcp port to listen',
@@ -19,18 +19,30 @@ const argv = yargs(hideBin(process.argv))
     .argv;
 
 const server = net.createServer(c => {
-    console.log(`client connected: ${c.remoteAddress}:${c.remotePort}`);
+    const clientIdent = socket => {
+        var ip = socket.remoteAddress;
+        if (! ip.search('::ffff:'))
+            ip = ip.slice('::ffff:'.length);
+        return `${ip}:${c.remotePort}`;
+    };
+    console.log(`client connected: ${clientIdent(c)}`);
+
     c.on('end', () => {
-        console.log(`client disconnected: ${c.remoteAddress}:${c.remotePort}`);
+        console.log(`client disconnected: ${clientIdent(c)}`);
     });
     c.on('data', data => {
-        console.log(`< ${c.remoteAddress}:${c.remotePort}:`, data.toString());
+        console.log(`< ${clientIdent(c)}: len ${data.length}`);
+        console.log(data.toString());
         c.write(data, err => {
             if (err)
-                console.error(`error when writing to ${c.remoteAddress}:${c.remotePort}:`, err.message);
+                console.error(`error when writing to ${clientIdent(c)}:`, err.message);
             else
-                console.log(`> ${c.remoteAddress}:${c.remotePort}:`, data.toString());
+                console.log(`> ${clientIdent(c)}: len ${data.length}`);
         });
+    })
+    c.on('error', err => {
+        console.error(`error from ${clientIdent(c)}:`
+            , err.code ? err.code : err.message);
     });
 });
 server.on('error', err => {
