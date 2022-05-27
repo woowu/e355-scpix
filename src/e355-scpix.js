@@ -561,7 +561,6 @@ const commandModemPower = (context, cb) => {
             }
             return cb(new Error('modem power state unknown'));
         });
-        return;
     };
 
     const powerOff = cb => {
@@ -669,6 +668,26 @@ const commandRunScpi = (context, cb) => {
         };
         execSpec(specs);
     });
+};
+
+const commandGpio = (context, cb) => {
+    const prefix = 'DIGital:PIN';
+    const readPin = (pin, cb) => {
+        runScpi(context, `${prefix}? ${pin}`, (response, cb) => {
+            console.log('level: ', response);
+            cb(null);
+        }, cb);
+    };
+    const setPin = (pin, value, cb) => {
+        if (value !== 0 && value !== 1)
+            return cb('bad argument');
+        runScpi(context, `${prefix} ${pin},${value === 0 ? 'LO' : 'HI'}`, (response, cb) => {
+            cb(null);
+        }, cb);
+    };
+    if (context.argv.value === undefined)
+        return readPin(context.argv.pin, cb);
+    setPin(context.argv.pin, +context.argv.value, cb);
 };
 
 const commandRunAt = (context, cb) => {
@@ -1349,6 +1368,17 @@ const argv = yargs(hideBin(process.argv))
                 type: 'string',
             });
     }, makeCommandHandler(commandRunScpi))
+    .command('gpio <pin> [value]', 'Read/set meter GPIO', yargs => {
+        yargs
+            .positional('pin', {
+                type: 'string',
+                describe: 'pin name',
+                })
+            .positional('value', {
+                type: 'number',
+                describe: '0 or 1',
+                });
+    }, makeCommandHandler(commandGpio))
     .command('at', 'Run AT script loaded from a file or read from stdin', yargs => {
         yargs
             .option('f', {
