@@ -1199,7 +1199,7 @@ const commandUnlockNb85 = (context, cb) => {
 };
 
 const argv = yargs(hideBin(process.argv))
-    .version('1.1.3-pre1')
+    .version('1.1.3-pre.5')
     .option('d', {
         alias: 'device',
         describe: 'Serial device name',
