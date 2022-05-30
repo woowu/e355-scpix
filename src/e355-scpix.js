@@ -262,6 +262,21 @@ const fileReducer = (context, file, resultSet, lineHandler, resultsHandler) => {
     });
 };
 
+const makeTimeoutFixer = () => {
+    var fixed = false;
+
+    return (context, cb) => {
+        if (fixed) return cb(null);
+        runScpi(context, scpi.setForwardingTimeout, (response, cb) => {
+            if (response) console.log('<', response);
+            cb(null);
+        }, err => {
+            fixed = true;
+            cb(null);
+        });
+    };
+};
+const timeoutFixer = makeTimeoutFixer();
 
 const runScpi = (context, command, onResponse, timeout, cb) => {
     if (typeof timeout == 'function') {
@@ -670,6 +685,10 @@ const commandRunScpi = (context, cb) => {
     });
 };
 
+const commandFixTimeout = (context, cb) => {
+    timeoutFixer(context, cb);
+};
+
 const commandGpio = (context, cb) => {
     const prefix = 'DIGital:PIN';
     const readPin = (pin, cb) => {
@@ -703,10 +722,8 @@ const commandRunAt = (context, cb) => {
                 ? tokens[2].trim() : ['OK\r\n', 'ERROR\r\n'],
         });
     }, specs => {
-        runScpi(context, scpi.setForwardingTimeout, (response, cb) => {
-            if (response) console.log('<', response);
-            cb(null);
-        }, () => {
+        timeoutFixer(context, err => {
+            if (err) return cb(err);
             makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
                 const execSpec = specs => {
                     if (! specs.length) return onExecEnd(null);
@@ -757,7 +774,7 @@ const commandConfigModem = (context, cb) => {
         `at+qicsgp=1,1,"${context.argv.apn}","${context.argv.username}","${context.argv.password}",0`,
     ];
 
-    const confSleepMode = cb => {
+    const confPowerControl = cb => {
         context.atSender({
             command: 'at+qcfg="gpio",2,26',
             timeout: atExecDelay,
@@ -765,35 +782,45 @@ const commandConfigModem = (context, cb) => {
             const prefix = '"gpio",';
             var i = resp.search(prefix);
             if (i < 0)
-                return cb(new Error('supcap indication gpio is not working'));
+                return cb(new Error('supercap indication gpio is not working'));
             var type = parseInt(resp[i + prefix.length]);
-            console.log('module', type == 1 ? 'with' : 'without', 'supcap');
+            if (type != 1 && type != 0)
+                return cb(new Error('unknown supercap type: ' + type));
+            console.log('module', type == 1 ? 'with' : 'without', 'supercap');
+
+            /* If it's with supercap, means the DTR is connected, we should use
+             * the DTR as sleep mode control; otherwise, the DTR is not
+             * connected, we must disable the sleep clock inside the modem to
+             * prevent it from sleeping.
+             * And, if it's with supercap, the fast/poweroff GPIO is not
+             * connected, then we should disable the fast/poweroff feature;
+             * otherwise, the fast/poweroff is connected, we should enable the
+             * featgure.
+             */
+            const enableFastPoweroff = type != 1;
             const sclk = type == 1 ? '1' : '0';
+
             context.atSender({
                 command: `at+qsclk=${sclk}`,
                 timeout: atExecDelay,
             }, (err, resp) => {
-                if (! type) {
-                    context.atSender({
-                        command: 'at+qcfg="fast/poweroff",25,1',
-                        timeout: atExecDelay,
-                    }, (err, resp) => {
-                        cb(err);
-                    });
-                } else
+                context.atSender({
+                    command: 'at+qcfg="fast/poweroff",25,'
+                        + (enableFastPoweroff ? '1' : '0'),
+                    timeout: atExecDelay,
+                }, (err, resp) => {
                     cb(err);
+                });
             });
         });
     };
 
-    runScpi(context, scpi.setForwardingTimeout, (response, cb) => {
-        if (response) console.log('<', response);
-        cb(null);
-    }, () => {
+    timeoutFixer(context, err => {
+        if (err) return cb(err);
         atScriptRunner(init, context, err => {
             if (err) return cb(err);
             makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
-                confSleepMode(onExecEnd);
+                confPowerControl(onExecEnd);
             }, cb);
         });
     });
@@ -801,6 +828,8 @@ const commandConfigModem = (context, cb) => {
 
 const commandModemInfo = (context, cb) => {
     const query = [
+        'at+qsclk?',
+        'at+qcfg="fast/poweroff"',
         'at+cimi',
         'at+cgmi',
         'at+cgmm',
@@ -823,10 +852,8 @@ const commandTcpOpen = (context, cb) => {
     var [ip, port] = context.argv.address.split(':');
     if (! ip || ! port) return cb(new Error('bad address'));
 
-    runScpi(context, scpi.setForwardingTimeout, (response, cb) => {
-        if (response) console.log('<', response);
-        cb(null);
-    }, () => {
+    timeoutFixer(context, err => {
+        if (err) return cb(err);
         makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
             tcpOpen(context, ip, +port, onExecEnd);
         }, cb);
@@ -1368,6 +1395,8 @@ const argv = yargs(hideBin(process.argv))
                 type: 'string',
             });
     }, makeCommandHandler(commandRunScpi))
+    .command('fix-timeout', 'enlarge the too short forwarding timeout', yargs => {
+    }, makeCommandHandler(commandFixTimeout))
     .command('gpio <pin> [value]', 'Read/set meter GPIO', yargs => {
         yargs
             .positional('pin', {
