@@ -653,7 +653,29 @@ const commandModemPower = (context, cb) => {
                             querySupercapType(context, (err, type) => {
                                 if (err) return onExecEnd(err);
                                 console.log((type == 1 ? 'with' : 'without') + ' supercap');
-                                onExecEnd(null);
+
+                                context.atSender({
+                                    command: 'at+qsclk?',
+                                    timeout: context.timing.atRespDelay,
+                                    expect: 'OK\r\n',
+                                }, (err, resp) => {
+                                    if (err) return onExecEnd(err);
+                                    if (resp.search(': 0\r\n') >= 0)
+                                        console.log('sleep clock disabled');
+                                    if (resp.search(': 1\r\n') >= 0)
+                                        console.log('sleep clock enabled');
+                                    context.atSender({
+                                        command: 'at+qcfg="fast/poweroff"',
+                                        timeout: context.timing.atRespDelay,
+                                        expect: 'OK\r\n',
+                                    }, (err, resp) => {
+                                        if (resp.search(',0\r\n') >= 0)
+                                            console.log('fast/poweroff disabled');
+                                        if (resp.search(',1\r\n') >= 0)
+                                            console.log('fast/poweroff enabled');
+                                        return onExecEnd(err);
+                                    });
+                                });
                             });
                         }, cb);
                     });
