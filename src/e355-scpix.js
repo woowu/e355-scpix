@@ -12,6 +12,7 @@ const scpi = {
     readModemPowerGoodPin: 'DIGital:PIN? P52',
     readModemDccPin: 'DIGital:PIN? P51',
     assertModemDcc: 'DIGital:PIN P51,HI',
+    readModemPowerUpFlags: 'MODEm:POWUp:Status?',
     deassertModemDcc: 'DIGital:PIN P51,LO',
     turnOnModemPowerKey: 'DIGital:PIN PD1,LO,500',
     turnOffModemPowerKey: 'DIGital:PIN PD1,LO,1000',
@@ -601,7 +602,13 @@ const commandModemPower = (context, cb) => {
                     ? 'asserted' : response == dccOffLevel ? 'deasserted'
                     : 'state unkonwn');
                 cb(null);
-            }, cb);
+            }, err => {
+                if (err) return cb(err);
+                runScpi(context, scpi.readModemPowerUpFlags, (response, cb) => {
+                    console.log('Power up flags', '0x' + parseInt(response).toString(16));
+                    cb(null);
+                }, cb);
+            });
         });
     };
 
