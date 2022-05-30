@@ -279,6 +279,42 @@ const makeTimeoutFixer = () => {
 };
 const timeoutFixer = makeTimeoutFixer();
 
+/**
+ * Assume it's already in AT environment.
+ */
+const querySupercapType = (context, cb) => {
+    context.atSender({
+        command: 'at+qcfg="gpio",2,26',
+        timeout: context.timing.atRespDelay,
+    }, (err, resp) => {
+        if (err) return cb(err);
+        const prefix = '"gpio",';
+        var i = resp.search(prefix);
+        if (i < 0)
+            return cb(new Error('supercap indication gpio is not working'));
+        var type = parseInt(resp[i + prefix.length]);
+        if (type != 1 && type != 0)
+            return cb(new Error('unknown supercap type: ' + type));
+        cb(null, type);
+    });
+};
+
+const readPin = (context, pin, cb) => {
+    const prefix = 'DIGital:PIN';
+    runScpi(context, `${prefix}? ${pin}`, (response, cb) => {
+        cb(null, parseInt(response));
+    }, cb);
+};
+
+const setPin = (context, pin, value, cb) => {
+    const prefix = 'DIGital:PIN';
+    if (value !== 0 && value !== 1)
+        return cb(new Error('bad argument'));
+    runScpi(context, `${prefix} ${pin},${value === 0 ? 'LO' : 'HI'}`, (response, cb) => {
+        cb(null);
+    }, cb);
+};
+
 const runScpi = (context, command, onResponse, timeout, cb) => {
     if (typeof timeout == 'function') {
         cb = timeout;
@@ -607,7 +643,21 @@ const commandModemPower = (context, cb) => {
                 runScpi(context, scpi.readModemPowerUpFlags, (response, cb) => {
                     console.log('Power up flags', '0x' + parseInt(response).toString(16));
                     cb(null);
-                }, cb);
+                }, () => {
+                    readPin(context, 'P53', (err, level) => {
+                        if (err) return cb(err);
+                        console.log('P53 level is', level);
+
+                        makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+                            if (err) return onExecEnd(err);
+                            querySupercapType(context, (err, type) => {
+                                if (err) return onExecEnd(err);
+                                console.log((type == 1 ? 'with' : 'without') + ' supercap');
+                                onExecEnd(null);
+                            });
+                        }, cb);
+                    });
+                });
             });
         });
     };
@@ -697,23 +747,13 @@ const commandFixTimeout = (context, cb) => {
 };
 
 const commandGpio = (context, cb) => {
-    const prefix = 'DIGital:PIN';
-    const readPin = (pin, cb) => {
-        runScpi(context, `${prefix}? ${pin}`, (response, cb) => {
-            console.log('level: ', response);
-            cb(null);
-        }, cb);
-    };
-    const setPin = (pin, value, cb) => {
-        if (value !== 0 && value !== 1)
-            return cb('bad argument');
-        runScpi(context, `${prefix} ${pin},${value === 0 ? 'LO' : 'HI'}`, (response, cb) => {
-            cb(null);
-        }, cb);
-    };
     if (context.argv.value === undefined)
-        return readPin(context.argv.pin, cb);
-    setPin(context.argv.pin, +context.argv.value, cb);
+        return readPin(context, context.argv.pin, (err, level) => {
+            if (err) return cb(err);
+            console.log('level', level);
+            return cb(null);
+        });
+    setPin(context, context.argv.pin, +context.argv.value, cb);
 };
 
 const commandRunAt = (context, cb) => {
@@ -747,8 +787,6 @@ const commandRunAt = (context, cb) => {
 };
 
 const commandConfigModem = (context, cb) => {
-    const atExecDelay = 1000;
-
     const network = context.argv.network.toUpperCase() == 'CATM'
         ? 0 : context.argv.network.toUpperCase() == 'NBIOT' ? 1 : -1;
     if (network < 0)
@@ -782,18 +820,8 @@ const commandConfigModem = (context, cb) => {
     ];
 
     const confPowerControl = cb => {
-        context.atSender({
-            command: 'at+qcfg="gpio",2,26',
-            timeout: atExecDelay,
-        }, (err, resp) => {
-            const prefix = '"gpio",';
-            var i = resp.search(prefix);
-            if (i < 0)
-                return cb(new Error('supercap indication gpio is not working'));
-            var type = parseInt(resp[i + prefix.length]);
-            if (type != 1 && type != 0)
-                return cb(new Error('unknown supercap type: ' + type));
-            console.log('module', type == 1 ? 'with' : 'without', 'supercap');
+        querySupercapType(context, (err, type) => {
+            if (err) return cb(err);
 
             /* If it's with supercap, means the DTR is connected, we should use
              * the DTR as sleep mode control; otherwise, the DTR is not
@@ -809,12 +837,12 @@ const commandConfigModem = (context, cb) => {
 
             context.atSender({
                 command: `at+qsclk=${sclk}`,
-                timeout: atExecDelay,
+                timeout: context.timing.atRespDelay,
             }, (err, resp) => {
                 context.atSender({
                     command: 'at+qcfg="fast/poweroff",25,'
                         + (enableFastPoweroff ? '1' : '0'),
-                    timeout: atExecDelay,
+                    timeout: context.timing.atRespDelay,
                 }, (err, resp) => {
                     cb(err);
                 });
