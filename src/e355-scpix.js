@@ -14,7 +14,7 @@ const scpi = {
     assertModemDcc: 'DIGital:PIN P51,HI',
     readModemPowerUpFlags: 'MODEm:POWUp:Status?',
     deassertModemDcc: 'DIGital:PIN P51,LO',
-    turnOnModemPowerKey: 'DIGital:PIN PD1,LO,500',
+    turnOnModemPowerKey: 'DIGital:PIN PD1,LO,650',
     turnOffModemPowerKey: 'DIGital:PIN PD1,LO,1000',
     enableSciLoopback: 'WAN:LOOPback:STOp',
     disableSciLoopback: 'WAN:LOOPback:STArt',
@@ -112,6 +112,8 @@ const makeCommandHandler = handler => {
             console.error('invalid mtu:', argv.mtu);
             return;
         }
+        if (! isNaN(+argv.atDelay))
+            realTiming.atRespDelay = +argv.atDelay;
 
         const device = new SerialPort({
             path: argv.device,
@@ -244,7 +246,10 @@ const fileReducer = (context, file, resultSet, lineHandler, resultsHandler) => {
     var rs;
     if (file != '-') {
         rs = fs.createReadStream(argv.file);
-        rs.on('error', cb);
+        rs.on('error', err => {
+            console.error(err.message);
+            resultsHandler(resultSet);
+        });
     } else
         rs = process.stdin;
     const rl = require('readline').createInterface({
@@ -340,19 +345,25 @@ const runScpi = (context, command, onResponse, timeout, cb) => {
     });
 };
 
-const makeAtEnvironment = (lineSender, execCb, onClose) => {
-    const forwardCommandDelay = 500;
+const makeAtEnvironment = (context, execCb, onClose) => {
+    const forwardCommandDelay = 1500;
 
-    lineSender(scpi.optoForwardingOn, () => {
+    runScpi(context, scpi.optoForwardingOn, (response, cb) => {
+        cb(response.search('ERROR') >= 0
+            ? new Error('BUSY: cannot start forwarding')
+            : null);
+    }, err => {
+        /* Some version of firmware does not send response back for the SER:CON,
+         * hence the timeout is not an error. In firmware versions which will
+         * response, it will send ERROR when error.
+         */
+        if (err && err.message.search('timeout') < 0) return onClose(err);
         setTimeout(() => {
-            /* when execution inside the execCb ends, the 2nd argument,
-             * which is a onExecEnd callback must be called.
-             */
             execCb(null, err => {
-                lineSender(scpi.optoForwardingOff, () => {
+                context.lineSender(scpi.optoForwardingOff, () => {
                     setTimeout(() => {
                         onClose(err);
-                    }, forwardCommandDelay);
+                    }, 200);
                 });
             });
         }, forwardCommandDelay);
@@ -386,7 +397,7 @@ const atScriptRunner = (script, context, alreadyInAt, cb) => {
     };
 
     if (alreadyInAt) return exec(cb);
-    makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+    makeAtEnvironment(context, (err, onExecEnd) => {
         exec(onExecEnd);
     }, cb);
 };
@@ -572,7 +583,8 @@ const commandTest = (context, cb) => {
 const commandModemPower = (context, cb) => {
     const dccWait = 100;
     const powerKeyWait = 1500;
-    const powerOnWait = 2000;
+    const powerOnWait = 2500;
+    const dccCreepingDelay = 1500;
 
     const powerOffLevel = '0';
     const powerOnLevel = '1';
@@ -588,22 +600,24 @@ const commandModemPower = (context, cb) => {
                 console.log('modem is off');
                 runScpi(context, scpi.assertModemDcc, (response, cb) => {
                 }, dccWait, err => {
-                    runScpi(context, scpi.turnOnModemPowerKey
-                        , (response, cb) => {
-                        }, powerKeyWait, err => {
-                            setTimeout(() => {
-                                runScpi(context, scpi.readModemPowerGoodPin
-                                    , (response, cb) => {
-                                        console.log('modem power is',
-                                            response == powerOffLevel
-                                            ? 'off'
-                                            : response == powerOnLevel
-                                            ? 'on'
-                                            : 'unknown');
-                                        cb(null);
-                                    }, cb);
-                        }, powerOnWait);
-                    });
+                    setTimeout(() => {
+                        runScpi(context, scpi.turnOnModemPowerKey
+                            , (response, cb) => {
+                            }, powerKeyWait, err => {
+                                setTimeout(() => {
+                                    runScpi(context, scpi.readModemPowerGoodPin
+                                        , (response, cb) => {
+                                            console.log('modem power is',
+                                                response == powerOffLevel
+                                                ? 'off'
+                                                : response == powerOnLevel
+                                                ? 'on'
+                                                : 'unknown');
+                                            cb(null);
+                                        }, cb);
+                            }, powerOnWait);
+                        });
+                    }, dccCreepingDelay);
                 });
                 return;
             }
@@ -641,14 +655,17 @@ const commandModemPower = (context, cb) => {
             }, err => {
                 if (err) return cb(err);
                 runScpi(context, scpi.readModemPowerUpFlags, (response, cb) => {
-                    console.log('Power up flags', '0x' + parseInt(response).toString(16));
+                    var n = +response;
+                    console.log(`PowerKey pressed ${(n & 0xff000000) >> 24} times;`
+                        + ` AT retried ${(n & 0x00ff0000) >> 16} times;`
+                        + ` Error flags: 0x${(n & 0xffff).toString(16).padStart(4, '0')}`);
                     cb(null);
                 }, () => {
                     readPin(context, 'P53', (err, level) => {
                         if (err) return cb(err);
                         console.log('P53 level is', level);
 
-                        makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+                        makeAtEnvironment(context, (err, onExecEnd) => {
                             if (err) return onExecEnd(err);
                             querySupercapType(context, (err, type) => {
                                 if (err) return onExecEnd(err);
@@ -779,7 +796,10 @@ const commandGpio = (context, cb) => {
 };
 
 const commandRunAt = (context, cb) => {
-    const execDelay = 50;
+    var execDelay = 500;
+
+    if (! isNaN(+context.argv.interDelay))
+        execDelay = +context.argv.interDelay;
 
     fileReducer(context, argv.file ? argv.file : '-', [], (line, cb) => {
         const tokens = line.split(';');
@@ -793,7 +813,7 @@ const commandRunAt = (context, cb) => {
     }, specs => {
         timeoutFixer(context, err => {
             if (err) return cb(err);
-            makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+            makeAtEnvironment(context, (err, onExecEnd) => {
                 const execSpec = specs => {
                     if (! specs.length) return onExecEnd(null);
                     context.atSender(specs.shift(), () => {
@@ -876,7 +896,7 @@ const commandConfigModem = (context, cb) => {
         if (err) return cb(err);
         atScriptRunner(init, context, err => {
             if (err) return cb(err);
-            makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+            makeAtEnvironment(context, (err, onExecEnd) => {
                 confPowerControl(onExecEnd);
             }, cb);
         });
@@ -911,7 +931,7 @@ const commandTcpOpen = (context, cb) => {
 
     timeoutFixer(context, err => {
         if (err) return cb(err);
-        makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+        makeAtEnvironment(context, (err, onExecEnd) => {
             tcpOpen(context, ip, +port, onExecEnd);
         }, cb);
     });
@@ -1080,7 +1100,7 @@ const commandTcpPing = (context, cb) => {
                 if (response) console.log('<', response);
                 cb(null);
             }, () => {
-                makeAtEnvironment(context.lineSender, atExec, cb);
+                makeAtEnvironment(context, atExec, cb);
             });
         }
     );
@@ -1091,7 +1111,7 @@ const commandTcpClose = (context, cb) => {
         if (response) console.log('<', response);
         cb(null);
     }, () => {
-        makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+        makeAtEnvironment(context, (err, onExecEnd) => {
             tcpClose(context, onExecEnd);
         }, cb);
     });
@@ -1106,7 +1126,7 @@ const commandTcpSend = (context, cb) => {
         if (response) console.log('<', response);
         cb(null);
     }, () => {
-        makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+        makeAtEnvironment(context, (err, onExecEnd) => {
             tcpSendBig(context, 0, generateText(len), mtu, onExecEnd);
         }, cb);
     });
@@ -1120,7 +1140,7 @@ const commandTcpRecv = (context, cb) => {
         cb(null);
     }, () => {
         var received = '';
-        makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+        makeAtEnvironment(context, (err, onExecEnd) => {
             const recv = (soFar, cb) => {
                 tcpRecv(context, (err, data) => {
                     if (err || ! data) return cb(err, soFar);
@@ -1186,7 +1206,7 @@ const commandUnlockNb85 = (context, cb) => {
 
     const retry = repeatCount => {
         const atTest = cb => {
-            makeAtEnvironment(context.lineSender, (err, onExecEnd) => {
+            makeAtEnvironment(context, (err, onExecEnd) => {
                 context.atSender({
                     command: 'at',
                     timeout: context.timing.atRespDelay,
@@ -1283,7 +1303,7 @@ const commandUnlockNb85 = (context, cb) => {
 };
 
 const argv = yargs(hideBin(process.argv))
-    .version('1.1.5')
+    .version('1.1.6')
     .option('d', {
         alias: 'device',
         describe: 'Serial device name',
@@ -1329,6 +1349,13 @@ const argv = yargs(hideBin(process.argv))
         describe: 'Use optical head',
         type: 'boolean',
         default: true,
+    })
+    .option('at-delay', {
+        alias: 'T',
+        describe: 'at response delay',
+        nargs: 1,
+        type: 'number',
+        default: 1000,
     })
     .option('simulate', {
         alias: 'm',
@@ -1472,6 +1499,12 @@ const argv = yargs(hideBin(process.argv))
                 describe: 'A file contains AT commands of "command[;timeout;expect]".'
                     + ' When this option is not present, read commands from stdin.',
                 type: 'string',
+            })
+            .option('--inter-delay', {
+                alias: 'R',
+                describe: 'delay time between execution of commands',
+                type: 'number',
+                default: 500,
             });
     }, makeCommandHandler(commandRunAt))
     .command('forward <status>', 'Turn on/off optical head forwarding', yargs => {
