@@ -57,7 +57,7 @@ const realTiming = {
     tcpPingDataWaitTimeout: 15000,
 };
 const forSimulatingTiming = {
-    atRespDelay: maxTimeout,
+    atRespDelay: 3000/*maxTimeout*/,
     scpiRespDelay: maxTimeout,
     tcpConnDelay: maxTimeout,
     tcpCloseDelay: maxTimeout,
@@ -831,18 +831,21 @@ const commandRunAt = (context, cb) => {
 const commandConfigModem = (context, cb) => {
     const network = context.argv.network.toUpperCase() == 'CATM'
         ? 0 : context.argv.network.toUpperCase() == 'NBIOT' ? 1 : -1;
+    const antenna = +context.argv.antenna;
     if (network < 0)
         return cb(new Error('Invalid network type'));
+    if (isNaN(antenna) || antenna < 0 || antenna > 1)
+        return cb(new Error('Invalid antenna type'));
 
     const init = [
         'ate0',
         'at+cmee=1',
         'at+cfun=1',
         /* pin26: input, supcap type */
-        'at+qcfg="gpio",1,26,0,0,0,0',
-        /* pin85: output, set antenna type = ext */
-        'at+qcfg="gpio",1,85,1,0,0,0',
-        'at+qcfg="gpio",3,85,1,1',
+        'at+qcfg="gpio",1,26,0,0,0,1',
+        /* pin85: output, set antenna type */
+        'at+qcfg="gpio",1,85,1,0,0,1',
+        `at+qcfg="gpio",3,85,${antenna},1`,
         /* pin64-pin66: charge level setup pins */
         'at+qcfg="gpio",1,64,0,0,0',
         'at+qcfg="gpio",3,64,0,0',
@@ -898,6 +901,28 @@ const commandConfigModem = (context, cb) => {
             if (err) return cb(err);
             makeAtEnvironment(context, (err, onExecEnd) => {
                 confPowerControl(onExecEnd);
+            }, cb);
+        });
+    });
+};
+
+const commandAntenna = (context, cb) => {
+    const antenna = +context.argv.type;
+    if (isNaN(antenna) || antenna < 0 || antenna > 1)
+        return cb(new Error('Invalid antenna type'));
+
+    const s = [
+        /* pin85: output, set antenna type */
+        'at+qcfg="gpio",1,85,1,0,0,1',
+        `at+qcfg="gpio",3,85,${antenna},1`,
+    ];
+
+    timeoutFixer(context, err => {
+        if (err) return cb(err);
+        atScriptRunner(s, context, err => {
+            if (err) return cb(err);
+            makeAtEnvironment(context, (err, onExecEnd) => {
+                onExecEnd(null);
             }, cb);
         });
     });
@@ -1303,7 +1328,7 @@ const commandUnlockNb85 = (context, cb) => {
 };
 
 const argv = yargs(hideBin(process.argv))
-    .version('1.1.6')
+    .version('1.1.7')
     .option('d', {
         alias: 'device',
         describe: 'Serial device name',
@@ -1383,8 +1408,22 @@ const argv = yargs(hideBin(process.argv))
                 nargs: 1,
                 type: 'string',
                 default: 'NBIoT',
+            })
+            .option('a', {
+                alias: 'antenna',
+                describe: 'antenna type. 0: internal; 1: external',
+                nargs: 1,
+                type: 'number',
+                default: 0,
             });
     }, makeCommandHandler(commandConfigModem))
+    .command('antenna <type>', 'Set antenna type', yargs => {
+        yargs
+            .positional('type', {
+                type: 'number',
+                describe: '0: internal; 1: external',
+                });
+    }, makeCommandHandler(commandAntenna))
     .command('modem-info', 'Modem/network information', yargs => {
     }, makeCommandHandler(commandModemInfo))
     .command('pdp-activate', 'Activate PDP context.', yargs => {
